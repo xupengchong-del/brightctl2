@@ -1,4 +1,4 @@
-// probe.c —— 实测 BetterDisplay 两条私有亮度路线的可调用性（内建屏 DisplayServices + 外接 DDC IOAVService）
+// probe.c —— 实测两条私有亮度路线的可调用性（内建屏 DisplayServices + 外接 DDC IOAVService）
 #include <stdio.h>
 #include <dlfcn.h>
 #include <stdint.h>
@@ -7,7 +7,7 @@
 
 typedef uint32_t CGDirectDisplayID;
 
-// DisplayServices 私有框架函数签名（依据框架导出符号表确认）
+// DisplayServices 私有框架函数签名（依据系统框架导出接口确认）
 typedef int  (*DSGetBrightness_fn)(CGDirectDisplayID, float*);
 typedef int  (*DSSetBrightness_fn)(CGDirectDisplayID, float);
 typedef int  (*DSCanChange_fn)(CGDirectDisplayID, bool*);

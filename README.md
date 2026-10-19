@@ -41,7 +41,7 @@ macOS 亮度控制工具，提供命令行与菜单栏应用两种形态。
 Apple 硬件屏的亮度由系统私有框架 `DisplayServices.framework` 管理，核心接口是：
 
 ```c
-_DisplayServicesSetBrightness((float)param_1);   // 亮度写
+_DisplayServicesSetBrightness(displayID, value);   // value 为 0.0~1.0
 ```
 
 即 `/System/Library/PrivateFrameworks/DisplayServices.framework` 的
@@ -106,7 +106,7 @@ clang -O2 -Wall -Wextra -o brightctl2 brightctl2.c -ldl \
 
 ## 菜单栏应用（BrightCtl.app）
 
-除了命令行，项目还提供一个菜单栏应用，形态类似 BetterDisplay：启动后常驻状态栏，点图标弹出面板。
+除了命令行，项目还提供一个菜单栏应用：启动后常驻状态栏，点图标弹出面板。
 
 ```bash
 make app          # 构建
@@ -212,8 +212,8 @@ display id=0x1 (内建)  brightness=56.0%  channel=DisplayServices
    VCP 0x10 可读（cur/max = 89/100），`84 03 10 ...` 可写并读回生效（89 → 81 → 89）。
 3. **旧版遗留问题已解决**：旧版记录「主屏 id=0x2 读亮度返回错误码」——那是外接屏，
    `DisplayServices` 对它返回 `1000` 且 `CanChangeBrightness=0`；现在该屏走 DDC 通道，读写均正常。
-4. **共存**：BetterDisplay（pid 25614）运行时会占用同一个 External 代理的 user client，
-   本工具与它可同时读取；若 BetterDisplay 开启了亮度同步/自动调节，两边会互相覆盖，见「已知限制」。
+4. **与其他亮度软件共存**：同一块外接屏可能被多个程序同时接管，
+   若另一个程序也在做亮度同步或自动调节，两边会互相覆盖，见「已知限制」。
 
 ---
 
@@ -248,7 +248,7 @@ display id=0x1 (内建)  brightness=56.0%  channel=DisplayServices
   这些接口不受 Apple 官方支持，**可能随系统更新失效**，也可能导致显示器行为异常；
   使用风险自负。此类用法不符合 Mac App Store 的上架要求，本项目仅面向开发者自编译使用。
 - DDC/CI 会向显示器写入 VCP 0x10。个别显示器对非标准时序敏感，请自行评估风险。
-- "BetterDisplay" 等名称归其各自所有者所有，本项目与其无隶属或授权关系。
+- 本项目与任何第三方商业软件无隶属或授权关系。
 
 ## 后续路线
 
