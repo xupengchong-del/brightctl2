@@ -73,8 +73,11 @@ uint32_t bctl_primary_display_id(void);
 bool bctl_builtin_blank(bool blank);
 bool bctl_builtin_is_blank(void);
 
-/* 当前活动的外接显示器数量（不依赖 DDC 是否可控） */
+/* 当前在线（含休眠）的外接显示器数量，不依赖 DDC 是否可控 */
 int  bctl_external_count(void);
+
+/* 是否有显示器正处于休眠状态（休眠期间不宜改动捕获状态） */
+bool bctl_displays_asleep(void);
 
 /* 是否为内建屏 */
 bool bctl_is_builtin(uint32_t display_id);

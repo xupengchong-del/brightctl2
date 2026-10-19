@@ -384,6 +384,11 @@ final class PanelViewController: NSViewController {
 
     @objc private func toggleBlank(_ sender: NSButton) {
         let want = sender.state == .on
+        // 用户手动点亮内屏，说明此刻想用双屏：同步关掉自动，避免被看门狗黑回去
+        if !want && Prefs.autoBlankBuiltin {
+            Prefs.autoBlankBuiltin = false
+            autoCheck.state = .off
+        }
         guard bctl_builtin_blank(want) else {
             sender.state = want ? .off : .on
             let alert = NSAlert()
@@ -402,12 +407,26 @@ final class PanelViewController: NSViewController {
     }
 }
 
+/// 追加一行诊断日志（/tmp/brightctl_app.log）
+func logLine(_ text: String) {
+    let path = "/tmp/brightctl_app.log"
+    let line = text + "\n"
+    if let fh = FileHandle(forWritingAtPath: path) {
+        fh.seekToEndOfFile()
+        fh.write(line.data(using: .utf8)!)
+        fh.closeFile()
+    } else {
+        try? line.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
+
 // MARK: - 显示器配置变更回调
 
 private func brightctlDisplayChanged(_ display: CGDirectDisplayID,
                                      _ flags: CGDisplayChangeSummaryFlags,
                                      _ userInfo: UnsafeMutableRawPointer?) {
     guard let userInfo else { return }
+    logLine("reconfig display=0x\(String(display, radix: 16)) flags=\(flags.rawValue)")
     let delegate = Unmanaged<AppDelegate>.fromOpaque(userInfo).takeUnretainedValue()
     DispatchQueue.main.async {
         delegate.handleDisplaysChanged()
@@ -468,6 +487,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 启动即按当前外屏情况执行一次（自检模式除外，避免干扰）
         if !ProcessInfo.processInfo.arguments.contains("--selftest") {
             applyAutoBlankIfNeeded()
+
+            // 看门狗：显示器休眠/唤醒会让系统释放捕获，这里定期补回来。
+            // 只读 CG 状态，不触发 DDC，开销很小。
+            Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+                self?.applyAutoBlankIfNeeded()
+            }
         }
 
         // 自检模式：程序化打开面板，确认控件真的能构造与显示，然后退出
@@ -513,13 +538,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? log.write(toFile: "/tmp/brightctl_app.log", atomically: true, encoding: .utf8)
     }
 
+    private var lastDecision = ""
+
     /// 统一处理内屏开关：有外屏且开启自动 → 关内屏；无外屏 → 必开内屏
     func applyAutoBlankIfNeeded() {
+        // 显示器休眠期间不要动捕获状态：休眠会改变 active 列表，
+        // 此时任何判断都不可靠，等唤醒后再说。
+        if bctl_displays_asleep() { return }
         let ext = bctl_external_count()
+        let blanked = bctl_builtin_is_blank()
+        var action = "none"
+
         if ext == 0 {
-            if bctl_builtin_is_blank() { _ = bctl_builtin_blank(false) }
-        } else if Prefs.autoBlankBuiltin && !bctl_builtin_is_blank() {
+            if blanked {
+                _ = bctl_builtin_blank(false)
+                action = "restore(no-external)"
+            }
+        } else if Prefs.autoBlankBuiltin && !blanked {
             _ = bctl_builtin_blank(true)
+            action = "blank(auto)"
+        }
+
+        // 只在状态变化时记一行，方便回溯真实场景
+        let decision = "ext=\(ext) blanked=\(blanked) auto=\(Prefs.autoBlankBuiltin) action=\(action)"
+        if decision != lastDecision {
+            lastDecision = decision
+            logLine("autoBlank " + decision)
         }
     }
 
@@ -528,13 +572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = bctl_probe(nil, 0)
         applyAutoBlankIfNeeded()
         panel.reload()
-        let ext = bctl_external_count()
-        let msg = "displaysChanged external=\(ext) blanked=\(bctl_builtin_is_blank())\n"
-        if let fh = FileHandle(forWritingAtPath: "/tmp/brightctl_app.log") {
-            fh.seekToEndOfFile()
-            fh.write(msg.data(using: .utf8)!)
-            fh.closeFile()
-        }
+        logLine("displaysChanged external=\(bctl_external_count()) blanked=\(bctl_builtin_is_blank())")
     }
 
     @objc private func togglePopover() {

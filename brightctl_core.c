@@ -349,18 +349,29 @@ static bool g_blanked;
 int bctl_external_count(void) {
     /* 仅供自动化测试模拟「没有外接显示器」的场景 */
     if (getenv("BRIGHTCTL_TEST_NO_EXTERNAL")) return 0;
+    /* 用 online 而不是 active：显示器休眠时会从 active 列表消失，
+     * 但它仍然连着、画面也还在，不能当成「外屏没了」。 */
     CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
     uint32_t n = 0;
-    if (CGGetActiveDisplayList(BCTL_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess) return 0;
+    if (CGGetOnlineDisplayList(BCTL_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess) return 0;
     int ext = 0;
     for (uint32_t i = 0; i < n; i++)
         if (!CGDisplayIsBuiltin(ids[i])) ext++;
     return ext;
 }
 
+bool bctl_displays_asleep(void) {
+    CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
+    uint32_t n = 0;
+    if (CGGetOnlineDisplayList(BCTL_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess) return false;
+    for (uint32_t i = 0; i < n; i++)
+        if (CGDisplayIsAsleep(ids[i])) return true;
+    return false;
+}
+
 bool bctl_builtin_blank(bool blank) {
     if (blank) {
-        if (g_blanked) return true;
+        if (bctl_builtin_is_blank()) return true;
         /* 安全阀：没有外接显示器时绝不能黑掉内屏，否则用户没有任何画面 */
         if (bctl_external_count() == 0) return false;
         CGDirectDisplayID target = 0;
@@ -388,7 +399,19 @@ bool bctl_builtin_blank(bool blank) {
     return true;
 }
 
-bool bctl_builtin_is_blank(void) { return g_blanked; }
+bool bctl_builtin_is_blank(void) {
+    if (!g_blanked) return false;
+    /* 显示器休眠/唤醒时系统可能自行释放捕获，这里以真实状态为准，
+     * 否则会一直以为还黑着而不去补。 */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (g_blank_id && !CGDisplayIsCaptured(g_blank_id)) {
+        g_blanked = false;
+        g_blank_id = 0;
+    }
+#pragma clang diagnostic pop
+    return g_blanked;
+}
 
 /* ---------- 本地化 ---------- */
 
