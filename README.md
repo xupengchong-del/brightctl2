@@ -245,6 +245,12 @@ display id=0x1 (内建)  brightness=56.0%  channel=DisplayServices
 
 ---
 
+## 关于协作
+
+- **Issue 面板已关闭**：本项目不接收问题反馈或功能请求。使用中遇到问题，请自行 fork 或下载代码修改。
+- **可以提 Pull Request**：欢迎提交改进，维护者会按需审阅；但不承诺合并，涉及私有接口的改动需要真机验证后才会考虑。
+- 项目主要在一台 Apple Silicon 机器 + LG UltraFine 外接屏上验证；其他显示器型号的适配情况未知，这属于预期内的差异。
+
 ## 许可与免责
 
 - 代码以 [MIT](LICENSE) 许可发布。
