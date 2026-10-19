@@ -1,15 +1,8 @@
 /*
  * brightctl2 —— macOS 亮度控制 CLI（核心逻辑见 brightctl_core.c）
  *
- * 用法:
- *   brightctl2                    列出显示器与当前亮度
- *   brightctl2 get <id>           读指定屏亮度（0-100）
- *   brightctl2 set <id> <v>       设亮度；v 可以是 0-100 或 +N / -N
- *   brightctl2 up [step]          主目标屏 +step（默认 5）
- *   brightctl2 down [step]        主目标屏 -step（默认 5）
- *   brightctl2 sync               其余可调屏亮度对齐主目标屏
- *   brightctl2 all <v>            所有可调屏设为 v
- *   brightctl2 blank [on|off]     内建屏黑屏 / 恢复（依赖本进程存活）
+ * 输出语言：默认跟随系统（zh/en），可用 --lang zh|en 或环境变量
+ * BRIGHTCTL_LANG 强制指定。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,34 +13,16 @@
 
 #include "brightctl_core.h"
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "用法:\n"
-        "  brightctl2                列出显示器与当前亮度\n"
-        "  brightctl2 get <id>       读亮度(0-100)\n"
-        "  brightctl2 set <id> <v>   设亮度; v 支持 0-100 或 +N / -N\n"
-        "  brightctl2 up [step]      主目标屏 +step (默认 5)\n"
-        "  brightctl2 down [step]    主目标屏 -step (默认 5)\n"
-        "  brightctl2 sync           其余可调屏对齐主目标屏\n"
-        "  brightctl2 all <v>        所有可调屏设为 v\n"
-        "  brightctl2 blank [on|off] 内建屏黑屏/恢复（进程需存活）\n");
-}
-
-static const char *channel_name(int ch) {
-    switch (ch) {
-        case BCTL_CHANNEL_DS:  return "DisplayServices";
-        case BCTL_CHANNEL_DDC: return "DDC";
-        default:               return "不可控";
-    }
-}
-
 static bctl_display g_list[BCTL_MAX_DISPLAYS];
 static int g_n;
 
 static void load(void) {
     bctl_init();
     g_n = bctl_probe(g_list, BCTL_MAX_DISPLAYS);
-    if (g_n <= 0) { fprintf(stderr, "枚举显示器失败\n"); exit(2); }
+    if (g_n <= 0) {
+        fprintf(stderr, "%s\n", bctl_t(BCTL_T_READ_FAIL));
+        exit(2);
+    }
 }
 
 static bctl_display *by_id(uint32_t id) {
@@ -66,155 +41,209 @@ static bool parse_id(const char *s, uint32_t *out) {
 static void cmd_list(void) {
     for (int i = 0; i < g_n; i++) {
         bctl_display *d = &g_list[i];
-        printf("display id=0x%x%s%s  brightness=", d->display_id,
-               d->is_main ? " (主屏)" : "", d->is_builtin ? " (内建)" : " (外接)");
-        if (d->percent < 0) printf("读取失败");
+        printf("display id=0x%x", d->display_id);
+        if (d->is_main) printf(" (%s)", bctl_t(BCTL_T_MAIN));
+        printf(" (%s)  brightness=",
+               d->is_builtin ? bctl_t(BCTL_T_BUILTIN) : bctl_t(BCTL_T_EXTERNAL));
+        if (d->percent < 0) printf("%s", bctl_t(BCTL_T_UNREADABLE));
         else                printf("%.1f%%", (double)d->percent);
-        printf("  channel=%s\n", channel_name(d->channel));
+        const char *ch = (d->channel == BCTL_CHANNEL_DS)  ? "DisplayServices"
+                       : (d->channel == BCTL_CHANNEL_DDC) ? "DDC"
+                       : bctl_t(BCTL_T_CH_NONE);
+        printf("  channel=%s\n", ch);
     }
-}
-
-static int cmd_get(const char *idarg) {
-    uint32_t id;
-    if (!parse_id(idarg, &id)) { fprintf(stderr, "显示器 id 无效: %s\n", idarg); return 2; }
-    if (!by_id(id)) { fprintf(stderr, "找不到显示器 0x%x\n", id); return 1; }
-    float p;
-    if (!bctl_get_percent(id, &p)) { fprintf(stderr, "读取亮度失败\n"); return 1; }
-    printf("%.1f\n", (double)p);
-    return 0;
-}
-
-static int cmd_set(const char *idarg, const char *valarg) {
-    uint32_t id;
-    if (!parse_id(idarg, &id)) { fprintf(stderr, "显示器 id 无效: %s\n", idarg); return 2; }
-    bctl_display *d = by_id(id);
-    if (!d) { fprintf(stderr, "找不到显示器 0x%x\n", id); return 1; }
-    if (d->channel == BCTL_CHANNEL_NONE) { fprintf(stderr, "显示器 0x%x 亮度不可控\n", id); return 1; }
-
-    char *end = NULL;
-    double v = strtod(valarg, &end);
-    if (end == valarg || *end != '\0') { fprintf(stderr, "亮度值无效: %s\n", valarg); return 2; }
-
-    bool relative = (valarg[0] == '+' || valarg[0] == '-');
-    float before;
-    if (!bctl_get_percent(id, &before)) { fprintf(stderr, "无法读取当前亮度\n"); return 1; }
-
-    if (relative) {
-        float after = bctl_step_percent(id, (float)v);
-        if (after < 0) { fprintf(stderr, "写入亮度失败\n"); return 1; }
-        printf("id=0x%x %.1f%% -> %.1f%%\n", id, (double)before, (double)after);
-        return 0;
-    }
-
-    if (v < 0 || v > 100) { fprintf(stderr, "亮度值需在 0-100: %s\n", valarg); return 2; }
-    int target = (int)lround(v);
-    if (target == (int)lroundf(before)) {
-        printf("id=0x%x %.1f%% (未变化)\n", id, (double)before);
-        return 0;
-    }
-    if (!bctl_set_percent(id, (float)target)) { fprintf(stderr, "写入亮度失败\n"); return 1; }
-    float after;
-    bctl_get_percent(id, &after);
-    printf("id=0x%x %.1f%% -> %.1f%%\n", id, (double)before, (double)after);
-    return 0;
-}
-
-static int cmd_step(bool up, int step) {
-    uint32_t id = bctl_primary_display_id();
-    if (!id) { fprintf(stderr, "没有可控显示器\n"); return 1; }
-    if (step < 0) step = -step;
-    float before, after;
-    if (!bctl_get_percent(id, &before)) { fprintf(stderr, "无法读取当前亮度\n"); return 1; }
-    after = bctl_step_percent(id, up ? (float)step : (float)-step);
-    if (after < 0) { fprintf(stderr, "写入亮度失败\n"); return 1; }
-    printf("id=0x%x %.1f%% -> %.1f%%\n", id, (double)before, (double)after);
-    return 0;
-}
-
-static int cmd_sync(void) {
-    uint32_t ref = bctl_primary_display_id();
-    if (!ref) { fprintf(stderr, "没有可控显示器\n"); return 1; }
-    float target;
-    if (!bctl_get_percent(ref, &target)) { fprintf(stderr, "无法读取参考屏亮度\n"); return 1; }
-    int changed = 0;
-    for (int i = 0; i < g_n; i++) {
-        bctl_display *d = &g_list[i];
-        if (d->display_id == ref || d->channel == BCTL_CHANNEL_NONE) continue;
-        if (bctl_set_percent(d->display_id, target)) changed++;
-    }
-    printf("已把 %d 台屏亮度对齐到 id=0x%x 的 %.1f%%\n", changed, ref, (double)target);
-    return 0;
-}
-
-static int cmd_all(const char *valarg) {
-    char *end = NULL;
-    double v = strtod(valarg, &end);
-    if (end == valarg || *end != '\0' || v < 0 || v > 100) {
-        fprintf(stderr, "亮度值无效: %s\n", valarg);
-        return 2;
-    }
-    int changed = 0;
-    for (int i = 0; i < g_n; i++) {
-        if (g_list[i].channel == BCTL_CHANNEL_NONE) continue;
-        if (bctl_set_percent(g_list[i].display_id, (float)v)) changed++;
-    }
-    if (!changed) { fprintf(stderr, "没有可控显示器\n"); return 1; }
-    printf("已把 %d 台屏亮度设为 %.0f%%\n", changed, v);
-    return 0;
-}
-
-static int cmd_blank(int argc, char **argv) {
-    bool on = true;
-    if (argc >= 3 && !strcmp(argv[2], "off")) on = false;
-    else if (argc >= 3 && !strcmp(argv[2], "on")) on = true;
-    else if (argc >= 3) { fprintf(stderr, "blank 参数只能是 on|off\n"); return 2; }
-
-    if (!bctl_builtin_blank(on)) { fprintf(stderr, "内建屏%s失败\n", on ? "黑屏" : "恢复"); return 1; }
-    if (!on) { printf("内建屏已恢复\n"); return 0; }
-    printf("内建屏已黑屏，按 Ctrl-C 恢复\n");
-    fflush(stdout);
-    for (;;) sleep(1);   /* 持有 capture，直到被中断 */
-    return 0;
 }
 
 int main(int argc, char **argv) {
-    if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help") ||
-                      !strcmp(argv[1], "help"))) {
-        usage(stdout);
+    /* 先剥离 --lang，保证之后所有文案都按目标语言输出 */
+    const char *lang = NULL;
+    int base = 1;
+    while (base < argc) {
+        if (!strcmp(argv[base], "--lang")) {
+            if (base + 1 >= argc) {
+                fprintf(stderr, "--lang needs zh|en\n");
+                return 2;
+            }
+            lang = argv[base + 1];
+            base += 2;
+        } else if (!strncmp(argv[base], "--lang=", 7)) {
+            lang = argv[base] + 7;
+            base += 1;
+        } else {
+            break;
+        }
+    }
+    bctl_set_language(lang);
+
+    if (base < argc && (!strcmp(argv[base], "-h") || !strcmp(argv[base], "--help") ||
+                        !strcmp(argv[base], "help"))) {
+        printf("%s", bctl_t(BCTL_T_USAGE));
         return 0;
     }
 
     load();
 
-    if (argc < 2 || !strcmp(argv[1], "list")) { cmd_list(); return 0; }
+    if (base >= argc || !strcmp(argv[base], "list")) { cmd_list(); return 0; }
 
-    const char *cmd = argv[1];
+    const char *cmd = argv[base];
+    const char *a1 = (base + 1 < argc) ? argv[base + 1] : NULL;
+    const char *a2 = (base + 2 < argc) ? argv[base + 2] : NULL;
     if (!strcmp(cmd, "get")) {
-        if (argc < 3) { fprintf(stderr, "get 需要显示器 id\n"); usage(stderr); return 2; }
-        return cmd_get(argv[2]);
+        if (!a1) { fprintf(stderr, "%s\n", bctl_t(BCTL_T_NEED_ID)); return 2; }
+        uint32_t id;
+        if (!parse_id(a1, &id)) {
+            fprintf(stderr, "%s: %s\n", bctl_t(BCTL_T_BAD_ID), a1);
+            return 2;
+        }
+        if (!by_id(id)) {
+            fprintf(stderr, "%s: 0x%x\n", bctl_t(BCTL_T_NO_DISPLAY), id);
+            return 1;
+        }
+        float p;
+        if (!bctl_get_percent(id, &p)) {
+            fprintf(stderr, "%s\n", bctl_t(BCTL_T_READ_FAIL));
+            return 1;
+        }
+        printf("%.1f\n", (double)p);
+        return 0;
     }
+
     if (!strcmp(cmd, "set")) {
-        if (argc < 4) { fprintf(stderr, "set 需要 <id> <v>\n"); usage(stderr); return 2; }
-        return cmd_set(argv[2], argv[3]);
+        if (!a2) { fprintf(stderr, "%s\n", bctl_t(BCTL_T_NEED_VALUE)); return 2; }
+        uint32_t id;
+        if (!parse_id(a1, &id)) {
+            fprintf(stderr, "%s: %s\n", bctl_t(BCTL_T_BAD_ID), a1);
+            return 2;
+        }
+        /* 先校验数值语法：参数写错属于用法错误，不应受屏幕当前状态影响 */
+        char *end = NULL;
+        double v = strtod(a2, &end);
+        if (end == a2 || *end != '\0') {
+            fprintf(stderr, "%s: %s\n", bctl_t(BCTL_T_BAD_VALUE), a2);
+            return 2;
+        }
+        bool relative = (a2[0] == '+' || a2[0] == '-');
+        if (!relative && (v < 0 || v > 100)) {
+            fprintf(stderr, "%s: %s\n", bctl_t(BCTL_T_RANGE), a2);
+            return 2;
+        }
+
+        bctl_display *d = by_id(id);
+        if (!d) {
+            fprintf(stderr, "%s: 0x%x\n", bctl_t(BCTL_T_NO_DISPLAY), id);
+            return 1;
+        }
+        if (d->channel == BCTL_CHANNEL_NONE) {
+            fprintf(stderr, "%s: 0x%x\n", bctl_t(BCTL_T_CH_NONE), id);
+            return 1;
+        }
+        float before;
+        if (!bctl_get_percent(id, &before)) {
+            fprintf(stderr, "%s\n", bctl_t(BCTL_T_READ_FAIL));
+            return 1;
+        }
+        if (relative) {
+            float after = bctl_step_percent(id, (float)v);
+            if (after < 0) { fprintf(stderr, "%s\n", bctl_t(BCTL_T_WRITE_FAIL)); return 1; }
+            printf("id=0x%x %.1f%% -> %.1f%%\n", id, (double)before, (double)after);
+            return 0;
+        }
+        int target = (int)lround(v);
+        if (target == (int)lroundf(before)) {
+            printf("id=0x%x %.1f%% (%s)\n", id, (double)before, bctl_t(BCTL_T_UNCHANGED));
+            return 0;
+        }
+        if (!bctl_set_percent(id, (float)target)) {
+            fprintf(stderr, "%s\n", bctl_t(BCTL_T_WRITE_FAIL));
+            return 1;
+        }
+        float after;
+        bctl_get_percent(id, &after);
+        printf("id=0x%x %.1f%% -> %.1f%%\n", id, (double)before, (double)after);
+        return 0;
     }
+
     if (!strcmp(cmd, "up") || !strcmp(cmd, "down")) {
         int step = 5;
-        if (argc >= 3) {
+        if (a1) {
             char *end = NULL;
-            long s = strtol(argv[2], &end, 10);
-            if (end == argv[2] || *end != '\0') { fprintf(stderr, "步长无效: %s\n", argv[2]); return 2; }
+            long s = strtol(a1, &end, 10);
+            if (end == a1 || *end != '\0') {
+                fprintf(stderr, "%s: %s\n", bctl_t(BCTL_T_NEED_STEP), a1);
+                return 2;
+            }
             step = (int)s;
         }
-        return cmd_step(cmd[0] == 'u', step);
+        uint32_t id = bctl_primary_display_id();
+        if (!id) { fprintf(stderr, "%s\n", bctl_t(BCTL_T_NO_CONTROLLABLE)); return 1; }
+        if (step < 0) step = -step;
+        float before, after;
+        if (!bctl_get_percent(id, &before)) {
+            fprintf(stderr, "%s\n", bctl_t(BCTL_T_READ_FAIL));
+            return 1;
+        }
+        after = bctl_step_percent(id, cmd[0] == 'u' ? (float)step : (float)-step);
+        if (after < 0) { fprintf(stderr, "%s\n", bctl_t(BCTL_T_WRITE_FAIL)); return 1; }
+        printf("id=0x%x %.1f%% -> %.1f%%\n", id, (double)before, (double)after);
+        return 0;
     }
-    if (!strcmp(cmd, "sync")) return cmd_sync();
-    if (!strcmp(cmd, "all")) {
-        if (argc < 3) { fprintf(stderr, "all 需要一个亮度值\n"); return 2; }
-        return cmd_all(argv[2]);
-    }
-    if (!strcmp(cmd, "blank")) return cmd_blank(argc, argv);
 
-    fprintf(stderr, "未知命令 %s\n", cmd);
-    usage(stderr);
+    if (!strcmp(cmd, "sync")) {
+        uint32_t ref = bctl_primary_display_id();
+        if (!ref) { fprintf(stderr, "%s\n", bctl_t(BCTL_T_NO_CONTROLLABLE)); return 1; }
+        float target;
+        if (!bctl_get_percent(ref, &target)) {
+            fprintf(stderr, "%s\n", bctl_t(BCTL_T_READ_FAIL));
+            return 1;
+        }
+        int changed = 0;
+        for (int i = 0; i < g_n; i++) {
+            bctl_display *d = &g_list[i];
+            if (d->display_id == ref || d->channel == BCTL_CHANNEL_NONE) continue;
+            if (bctl_set_percent(d->display_id, target)) changed++;
+        }
+        printf(bctl_t(BCTL_T_SYNC_DONE), changed, ref, (double)target);
+        printf("\n");
+        return 0;
+    }
+
+    if (!strcmp(cmd, "all")) {
+        if (!a1) { fprintf(stderr, "%s\n", bctl_t(BCTL_T_NEED_VALUE)); return 2; }
+        char *end = NULL;
+        double v = strtod(a1, &end);
+        if (end == a1 || *end != '\0' || v < 0 || v > 100) {
+            fprintf(stderr, "%s: %s\n", bctl_t(BCTL_T_BAD_VALUE), a1);
+            return 2;
+        }
+        int changed = 0;
+        for (int i = 0; i < g_n; i++) {
+            if (g_list[i].channel == BCTL_CHANNEL_NONE) continue;
+            if (bctl_set_percent(g_list[i].display_id, (float)v)) changed++;
+        }
+        if (!changed) { fprintf(stderr, "%s\n", bctl_t(BCTL_T_NO_CONTROLLABLE)); return 1; }
+        printf(bctl_t(BCTL_T_ALL_DONE), changed, v);
+        printf("\n");
+        return 0;
+    }
+
+    if (!strcmp(cmd, "blank")) {
+        bool on = true;
+        if (a1) {
+            if (!strcmp(a1, "off")) on = false;
+            else if (!strcmp(a1, "on")) on = true;
+            else { fprintf(stderr, "%s\n", bctl_t(BCTL_T_BLANK_ARG)); return 2; }
+        }
+        if (!bctl_builtin_blank(on)) {
+            fprintf(stderr, "%s\n", bctl_t(on ? BCTL_T_BLANK_FAIL_ON : BCTL_T_BLANK_FAIL_OFF));
+            return 1;
+        }
+        if (!on) { printf("%s\n", bctl_t(BCTL_T_BLANK_OFF)); return 0; }
+        printf("%s\n", bctl_t(BCTL_T_BLANK_ON));
+        fflush(stdout);
+        for (;;) sleep(1);
+    }
+
+    fprintf(stderr, "%s: %s\n", bctl_t(BCTL_T_UNKNOWN_CMD), cmd);
+    printf("%s", bctl_t(BCTL_T_USAGE));
     return 2;
 }

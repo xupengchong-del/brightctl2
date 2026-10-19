@@ -6,6 +6,34 @@
 
 #define BCTL_MAX_DISPLAYS 16
 
+/* ---------- 本地化 ---------- */
+
+typedef enum {
+    BCTL_T_MAIN = 0, BCTL_T_BUILTIN, BCTL_T_EXTERNAL, BCTL_T_UNREADABLE,
+    BCTL_T_CH_NONE, BCTL_T_CH_DS, BCTL_T_CH_DDC,
+
+    BCTL_T_USAGE,
+    BCTL_T_NEED_ID, BCTL_T_BAD_ID, BCTL_T_NO_DISPLAY, BCTL_T_BAD_VALUE, BCTL_T_RANGE,
+    BCTL_T_READ_FAIL, BCTL_T_WRITE_FAIL, BCTL_T_NO_CONTROLLABLE, BCTL_T_UNKNOWN_CMD,
+    BCTL_T_UNCHANGED, BCTL_T_SYNC_DONE, BCTL_T_ALL_DONE,
+    BCTL_T_BLANK_ON, BCTL_T_BLANK_OFF, BCTL_T_BLANK_FAIL_ON, BCTL_T_BLANK_FAIL_OFF, BCTL_T_BLANK_ARG,
+    BCTL_T_NEED_VALUE, BCTL_T_NEED_STEP,
+
+    BCTL_T_PANEL_TITLE, BCTL_T_HINT, BCTL_T_CHECK_BLANK, BCTL_T_CHECK_AUTO,
+    BCTL_T_CHECK_LOGIN, BCTL_T_QUIT, BCTL_T_LANG_LABEL, BCTL_T_LANG_AUTO,
+    BCTL_T_ALERT_LOGIN_TITLE, BCTL_T_ALERT_LOGIN_MSG,
+    BCTL_T_ALERT_BLANK_ON_TITLE, BCTL_T_ALERT_BLANK_ON_MSG,
+    BCTL_T_ALERT_BLANK_OFF_TITLE, BCTL_T_ALERT_BLANK_OFF_MSG,
+
+    BCTL_T_COUNT
+} bctl_str;
+
+/* 语言：NULL 或 "auto" 跟随系统；"zh" / "en" 强制 */
+void        bctl_set_language(const char *lang);
+const char *bctl_language(void);      /* 当前生效的 "zh" 或 "en" */
+const char *bctl_language_setting(void); /* 当前设置：auto / zh / en */
+const char *bctl_t(int key);
+
 enum {
     BCTL_CHANNEL_NONE = 0,
     BCTL_CHANNEL_DS   = 1,   /* DisplayServices */

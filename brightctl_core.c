@@ -11,12 +11,31 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <dlfcn.h>
 #include <IOKit/IOKitLib.h>
 #include <CoreGraphics/CoreGraphics.h>
 
-#define DDC_RETRIES   3
+#define DDC_RETRIES   5
 #define DDC_SETTLE_US 40000
+
+/* 跨进程互斥：CLI 与菜单栏应用共用同一条 I2C 总线，
+ * 并发访问会让显示器漏掉事务，因此用文件锁把 DDC 操作串行化。 */
+static int g_lock_fd = -1;
+
+static void ddc_lock(void) {
+    if (g_lock_fd < 0) {
+        char path[64];
+        snprintf(path, sizeof path, "/tmp/.brightctl-i2c-%d.lock", (int)getuid());
+        g_lock_fd = open(path, O_CREAT | O_RDWR, 0600);
+    }
+    if (g_lock_fd >= 0) flock(g_lock_fd, LOCK_EX);
+}
+
+static void ddc_unlock(void) {
+    if (g_lock_fd >= 0) flock(g_lock_fd, LOCK_UN);
+}
 
 typedef struct __IOAVService *IOAVServiceRef;
 
@@ -100,6 +119,7 @@ static int collect_external_services(io_service_t *out, int max) {
 
 static bool ddc_read(IOAVServiceRef av, int *cur, int *maxv) {
     if (!av) return false;
+    ddc_lock();
     for (int attempt = 0; attempt < DDC_RETRIES; attempt++) {
         uint8_t req[4] = {0x82, 0x01, 0x10, 0x00};
         if (IOAVServiceWriteI2C(av, 0x37, 0x51, req, sizeof req) != 0) {
@@ -126,8 +146,10 @@ static bool ddc_read(IOAVServiceRef av, int *cur, int *maxv) {
         if (mx <= 0) continue;
         *maxv = mx;
         *cur = cu;
+        ddc_unlock();
         return true;
     }
+    ddc_unlock();
     return false;
 }
 
@@ -139,9 +161,15 @@ static bool ddc_write(IOAVServiceRef av, int raw) {
     uint8_t sum = 0;
     for (int i = 0; i < 5; i++) sum ^= req[i];
     req[5] = (uint8_t)(0x6e ^ 0x51 ^ sum);
-    if (IOAVServiceWriteI2C(av, 0x37, 0x51, req, sizeof req) != 0) return false;
+    ddc_lock();
+    bool ok = false;
+    for (int attempt = 0; attempt < DDC_RETRIES; attempt++) {
+        if (IOAVServiceWriteI2C(av, 0x37, 0x51, req, sizeof req) == 0) { ok = true; break; }
+        usleep(DDC_SETTLE_US);
+    }
     usleep(DDC_SETTLE_US * 2);
-    return true;
+    ddc_unlock();
+    return ok;
 }
 
 /* ---------- 探测与访问 ---------- */
@@ -361,3 +389,127 @@ bool bctl_builtin_blank(bool blank) {
 }
 
 bool bctl_builtin_is_blank(void) { return g_blanked; }
+
+/* ---------- 本地化 ---------- */
+
+typedef struct { const char *zh; const char *en; } bctl_msg;
+
+static const bctl_msg g_msgs[BCTL_T_COUNT] = {
+    [BCTL_T_MAIN]       = {"主屏", "main"},
+    [BCTL_T_BUILTIN]    = {"内建", "built-in"},
+    [BCTL_T_EXTERNAL]   = {"外接", "external"},
+    [BCTL_T_UNREADABLE] = {"读取失败", "unreadable"},
+    [BCTL_T_CH_NONE]    = {"不可控", "unavailable"},
+    [BCTL_T_CH_DS]      = {"DisplayServices", "DisplayServices"},
+    [BCTL_T_CH_DDC]     = {"DDC", "DDC"},
+
+    [BCTL_T_USAGE] = {
+        "用法:\n"
+        "  brightctl2                列出显示器与当前亮度\n"
+        "  brightctl2 get <id>       读亮度(0-100)\n"
+        "  brightctl2 set <id> <v>   设亮度; v 支持 0-100 或 +N / -N\n"
+        "  brightctl2 up [step]      主目标屏 +step (默认 5)\n"
+        "  brightctl2 down [step]    主目标屏 -step (默认 5)\n"
+        "  brightctl2 sync           其余可调屏对齐主目标屏\n"
+        "  brightctl2 all <v>        所有可调屏设为 v\n"
+        "  brightctl2 blank [on|off] 内建屏黑屏/恢复（进程需存活）\n"
+        "  brightctl2 --lang zh|en   手动指定输出语言\n",
+        "Usage:\n"
+        "  brightctl2                list displays and current brightness\n"
+        "  brightctl2 get <id>       read brightness (0-100)\n"
+        "  brightctl2 set <id> <v>   set brightness; v may be 0-100 or +N / -N\n"
+        "  brightctl2 up [step]      primary target +step (default 5)\n"
+        "  brightctl2 down [step]    primary target -step (default 5)\n"
+        "  brightctl2 sync           align other controllable displays to primary\n"
+        "  brightctl2 all <v>        set every controllable display to v\n"
+        "  brightctl2 blank [on|off] blank/restore built-in display (process must live)\n"
+        "  brightctl2 --lang zh|en   force the output language\n"
+    },
+    [BCTL_T_NEED_ID]          = {"需要显示器 id", "display id required"},
+    [BCTL_T_BAD_ID]           = {"显示器 id 无效", "invalid display id"},
+    [BCTL_T_NO_DISPLAY]       = {"找不到显示器", "display not found"},
+    [BCTL_T_BAD_VALUE]        = {"亮度值无效", "invalid brightness value"},
+    [BCTL_T_RANGE]            = {"亮度值需在 0-100", "brightness must be within 0-100"},
+    [BCTL_T_READ_FAIL]        = {"读取亮度失败", "failed to read brightness"},
+    [BCTL_T_WRITE_FAIL]       = {"写入亮度失败", "failed to write brightness"},
+    [BCTL_T_NO_CONTROLLABLE]  = {"没有可控显示器", "no controllable display"},
+    [BCTL_T_UNKNOWN_CMD]      = {"未知命令", "unknown command"},
+    [BCTL_T_UNCHANGED]        = {"未变化", "unchanged"},
+    [BCTL_T_SYNC_DONE]        = {"已把 %d 台屏亮度对齐到 id=0x%x 的 %.1f%%",
+                                 "aligned %d display(s) to id=0x%x at %.1f%%"},
+    [BCTL_T_ALL_DONE]         = {"已把 %d 台屏亮度设为 %.0f%%",
+                                 "set %d display(s) to %.0f%%"},
+    [BCTL_T_BLANK_ON]         = {"内建屏已黑屏，按 Ctrl-C 恢复",
+                                 "built-in display blanked; press Ctrl-C to restore"},
+    [BCTL_T_BLANK_OFF]        = {"内建屏已恢复", "built-in display restored"},
+    [BCTL_T_BLANK_FAIL_ON]    = {"内建屏黑屏失败", "failed to blank the built-in display"},
+    [BCTL_T_BLANK_FAIL_OFF]   = {"内建屏恢复失败", "failed to restore the built-in display"},
+    [BCTL_T_BLANK_ARG]        = {"blank 参数只能是 on|off", "blank accepts only on|off"},
+    [BCTL_T_NEED_VALUE]       = {"需要一个亮度值", "a brightness value is required"},
+    [BCTL_T_NEED_STEP]        = {"步长无效", "invalid step"},
+
+    [BCTL_T_PANEL_TITLE]      = {"显示器亮度", "Display brightness"},
+    [BCTL_T_HINT]             = {"拖动即生效", "Changes apply while dragging"},
+    [BCTL_T_CHECK_BLANK]      = {"关闭内建屏（黑屏）", "Blank built-in display"},
+    [BCTL_T_CHECK_AUTO]       = {"接上外屏时自动关闭内屏",
+                                 "Blank built-in when an external display is connected"},
+    [BCTL_T_CHECK_LOGIN]      = {"开机自动启动", "Launch at login"},
+    [BCTL_T_QUIT]             = {"退出 BrightCtl", "Quit BrightCtl"},
+    [BCTL_T_LANG_LABEL]       = {"语言", "Language"},
+    [BCTL_T_LANG_AUTO]        = {"跟随系统", "Automatic"},
+    [BCTL_T_ALERT_LOGIN_TITLE] = {"无法设置开机自启", "Cannot change login item"},
+    [BCTL_T_ALERT_LOGIN_MSG]   = {"请先把 BrightCtl.app 安装到 /Applications（make install），再重试。当前状态：%s",
+                                  "Install BrightCtl.app into /Applications first (make install), then retry. Current status: %s"},
+    [BCTL_T_ALERT_BLANK_ON_TITLE] = {"无法关闭内建屏", "Cannot blank the built-in display"},
+    [BCTL_T_ALERT_BLANK_ON_MSG]   = {"未检测到外接显示器。为免失去所有画面，已拒绝关闭内屏。",
+                                     "No external display detected. Refusing to blank the built-in display so you do not lose all video output."},
+    [BCTL_T_ALERT_BLANK_OFF_TITLE] = {"无法恢复内建屏", "Cannot restore the built-in display"},
+    [BCTL_T_ALERT_BLANK_OFF_MSG]   = {"释放捕获失败，请重新打开面板重试。",
+                                      "Failed to release the capture. Reopen the panel and try again."},
+};
+
+static char g_lang_setting[8] = "auto";
+static char g_lang_effective[8] = "en";
+
+static const char *system_language(void) {
+    CFArrayRef langs = CFLocaleCopyPreferredLanguages();
+    const char *out = "en";
+    if (langs && CFArrayGetCount(langs) > 0) {
+        CFStringRef first = (CFStringRef)CFArrayGetValueAtIndex(langs, 0);
+        char buf[32] = "";
+        if (CFStringGetCString(first, buf, sizeof buf, kCFStringEncodingUTF8)) {
+            if (strncmp(buf, "zh", 2) == 0) out = "zh";
+        }
+    }
+    if (langs) CFRelease(langs);
+    return out;
+}
+
+static void resolve_language(void) {
+    /* 优先级：显式设置（--lang / 面板选择）> 环境变量 > 系统语言 */
+    if (strcmp(g_lang_setting, "zh") == 0) { strcpy(g_lang_effective, "zh"); return; }
+    if (strcmp(g_lang_setting, "en") == 0) { strcpy(g_lang_effective, "en"); return; }
+
+    const char *env = getenv("BRIGHTCTL_LANG");
+    if (env && *env) {
+        if (strncmp(env, "zh", 2) == 0) { strcpy(g_lang_effective, "zh"); return; }
+        if (strncmp(env, "en", 2) == 0) { strcpy(g_lang_effective, "en"); return; }
+    }
+    strcpy(g_lang_effective, system_language());
+}
+
+void bctl_set_language(const char *lang) {
+    if (!lang || !*lang) lang = "auto";
+    snprintf(g_lang_setting, sizeof g_lang_setting, "%s", lang);
+    resolve_language();
+}
+
+const char *bctl_language(void) { return g_lang_effective; }
+const char *bctl_language_setting(void) { return g_lang_setting; }
+
+const char *bctl_t(int key) {
+    if (key < 0 || key >= BCTL_T_COUNT) return "";
+    const bctl_msg *m = &g_msgs[key];
+    return (strcmp(g_lang_effective, "zh") == 0) ? m->zh : m->en;
+}
+

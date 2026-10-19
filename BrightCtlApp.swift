@@ -2,9 +2,23 @@ import Cocoa
 import Foundation
 import ServiceManagement
 
+// MARK: - 本地化
+
+/// 从 C 核心取文案，与 CLI 共用同一套语言判断
+func L(_ key: UInt32) -> String {
+    guard let p = bctl_t(Int32(key)) else { return "" }
+    return String(cString: p)
+}
+
 // MARK: - 偏好设置
 
 enum Prefs {
+    /// 语言设置："auto" / "zh" / "en"
+    static var language: String {
+        get { UserDefaults.standard.string(forKey: "language") ?? "auto" }
+        set { UserDefaults.standard.set(newValue, forKey: "language") }
+    }
+
     /// 接上外接屏时自动关闭内屏（默认开启）
     static var autoBlankBuiltin: Bool {
         get {
@@ -85,8 +99,10 @@ final class DisplayRow: NSView {
         self.displayID = display.display_id
         super.init(frame: .zero)
 
-        var title = display.is_builtin ? "内建屏" : "外接屏"
-        if display.is_main { title += "（主屏）" }
+        var title = display.is_builtin ? L(BCTL_T_BUILTIN.rawValue) : L(BCTL_T_EXTERNAL.rawValue)
+        if display.is_main {
+            title += bctl_language() == nil ? "" : (String(cString: bctl_language()) == "zh" ? "（主屏）" : " (main)")
+        }
         title += String(format: "  0x%x", display.display_id)
         nameLabel.stringValue = title
         nameLabel.font = .systemFont(ofSize: 12, weight: .medium)
@@ -155,12 +171,47 @@ final class DisplayRow: NSView {
 final class PanelViewController: NSViewController {
     private var rows: [DisplayRow] = []
     private var timer: Timer?
-    private let titleLabel = NSTextField(labelWithString: "显示器亮度")
-    private let blankCheck = NSButton(checkboxWithTitle: "关闭内建屏（黑屏）", target: nil, action: nil)
-    private let loginCheck = NSButton(checkboxWithTitle: "开机自动启动", target: nil, action: nil)
-    private let autoCheck = NSButton(checkboxWithTitle: "接上外屏时自动关闭内屏", target: nil, action: nil)
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let blankCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let loginCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let autoCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let langPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let hintLabel = NSTextField(labelWithString: "")
     private let stack = NSStackView()
+    private let quit = NSButton(title: "", target: nil, action: nil)
+
+    /// 切换语言后刷新所有静态文案
+    private func applyTexts() {
+        titleLabel.stringValue = L(BCTL_T_PANEL_TITLE.rawValue)
+        hintLabel.stringValue = L(BCTL_T_HINT.rawValue)
+        blankCheck.title = L(BCTL_T_CHECK_BLANK.rawValue)
+        loginCheck.title = L(BCTL_T_CHECK_LOGIN.rawValue)
+        autoCheck.title = L(BCTL_T_CHECK_AUTO.rawValue)
+        quit.title = L(BCTL_T_QUIT.rawValue)
+
+        langPopup.removeAllItems()
+        langPopup.addItem(withTitle: L(BCTL_T_LANG_AUTO.rawValue))
+        langPopup.addItem(withTitle: "中文")
+        langPopup.addItem(withTitle: "English")
+        switch Prefs.language {
+        case "zh": langPopup.selectItem(at: 1)
+        case "en": langPopup.selectItem(at: 2)
+        default:   langPopup.selectItem(at: 0)
+        }
+    }
+
+    @objc private func languageChanged(_ sender: NSPopUpButton) {
+        let value: String
+        switch sender.indexOfSelectedItem {
+        case 1: value = "zh"
+        case 2: value = "en"
+        default: value = "auto"
+        }
+        Prefs.language = value
+        bctl_set_language(value)
+        applyTexts()
+        rebuild()
+    }
 
     override func loadView() {
         let v = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 220))
@@ -176,7 +227,11 @@ final class PanelViewController: NSViewController {
 
         hintLabel.font = .systemFont(ofSize: 10)
         hintLabel.textColor = .tertiaryLabelColor
-        hintLabel.stringValue = "拖动即生效"
+
+        langPopup.target = self
+        langPopup.action = #selector(languageChanged(_:))
+        langPopup.font = .systemFont(ofSize: 11)
+        langPopup.controlSize = .small
 
         blankCheck.target = self
         blankCheck.action = #selector(toggleBlank(_:))
@@ -189,7 +244,8 @@ final class PanelViewController: NSViewController {
         autoCheck.action = #selector(toggleAuto(_:))
         autoCheck.state = Prefs.autoBlankBuiltin ? .on : .off
 
-        let quit = NSButton(title: "退出 BrightCtl", target: self, action: #selector(quitApp))
+        quit.target = self
+        quit.action = #selector(quitApp)
         quit.bezelStyle = .inline
         quit.isBordered = false
         quit.font = .systemFont(ofSize: 11)
@@ -201,6 +257,7 @@ final class PanelViewController: NSViewController {
         v.addSubview(blankCheck)
         v.addSubview(loginCheck)
         v.addSubview(autoCheck)
+        v.addSubview(langPopup)
         v.addSubview(quit)
 
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -208,6 +265,7 @@ final class PanelViewController: NSViewController {
         blankCheck.translatesAutoresizingMaskIntoConstraints = false
         loginCheck.translatesAutoresizingMaskIntoConstraints = false
         autoCheck.translatesAutoresizingMaskIntoConstraints = false
+        langPopup.translatesAutoresizingMaskIntoConstraints = false
         quit.translatesAutoresizingMaskIntoConstraints = false
 
         NSLayoutConstraint.activate([
@@ -230,7 +288,10 @@ final class PanelViewController: NSViewController {
             loginCheck.topAnchor.constraint(equalTo: autoCheck.bottomAnchor, constant: 4),
             loginCheck.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 14),
 
-            quit.topAnchor.constraint(equalTo: loginCheck.bottomAnchor, constant: 6),
+            langPopup.topAnchor.constraint(equalTo: loginCheck.bottomAnchor, constant: 8),
+            langPopup.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 14),
+
+            quit.topAnchor.constraint(equalTo: langPopup.bottomAnchor, constant: 6),
             quit.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 14),
             quit.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -10),
         ])
@@ -267,6 +328,7 @@ final class PanelViewController: NSViewController {
             row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
             rows.append(row)
         }
+        applyTexts()
         let ext = bctl_external_count()
         blankCheck.state = bctl_builtin_is_blank() ? .on : .off
         blankCheck.isEnabled = ext > 0
@@ -277,7 +339,7 @@ final class PanelViewController: NSViewController {
         autoCheck.state = Prefs.autoBlankBuiltin ? .on : .off
 
         // 面板高度随屏数变化
-        let height = CGFloat(150 + n * 56)
+        let height = CGFloat(182 + n * 56)
         view.setFrameSize(NSSize(width: 320, height: height))
         preferredContentSize = NSSize(width: 320, height: height)
     }
@@ -314,8 +376,8 @@ final class PanelViewController: NSViewController {
         if !LoginItem.set(want) {
             sender.state = want ? .off : .on
             let alert = NSAlert()
-            alert.messageText = "无法设置开机自启"
-            alert.informativeText = "请先把 BrightCtl.app 安装到 /Applications（make install），再重试。当前状态：\(LoginItem.statusText)"
+            alert.messageText = L(BCTL_T_ALERT_LOGIN_TITLE.rawValue)
+            alert.informativeText = String(format: L(BCTL_T_ALERT_LOGIN_MSG.rawValue), LoginItem.statusText)
             alert.runModal()
         }
     }
@@ -325,10 +387,10 @@ final class PanelViewController: NSViewController {
         guard bctl_builtin_blank(want) else {
             sender.state = want ? .off : .on
             let alert = NSAlert()
-            alert.messageText = want ? "无法关闭内建屏" : "无法恢复内建屏"
-            alert.informativeText = want
-                ? "未检测到外接显示器。为免失去所有画面，已拒绝关闭内屏。"
-                : "释放捕获失败，请重新打开面板重试。"
+            alert.messageText = want ? L(BCTL_T_ALERT_BLANK_ON_TITLE.rawValue)
+                                     : L(BCTL_T_ALERT_BLANK_OFF_TITLE.rawValue)
+            alert.informativeText = want ? L(BCTL_T_ALERT_BLANK_ON_MSG.rawValue)
+                                         : L(BCTL_T_ALERT_BLANK_OFF_MSG.rawValue)
             alert.runModal()
             return
         }
@@ -360,6 +422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let panel = PanelViewController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        bctl_set_language((Prefs.language as NSString).utf8String)
         // 命令行开关登录项，便于安装脚本调用
         let args = ProcessInfo.processInfo.arguments
         if args.contains("--enable-login") || args.contains("--disable-login") {
@@ -418,6 +481,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     s += "selftest popoverShown=\(self.popover.isShown)"
                     s += " rows=\(self.panel.rowCount)"
                     s += " rowsEnabled=\(self.panel.enabledRowCount)\n"
+                    s += "lang setting=\(Prefs.language) effective=\(String(cString: bctl_language()))\n"
+                    s += "texts title=[\(L(BCTL_T_PANEL_TITLE.rawValue))] blank=[\(L(BCTL_T_CHECK_BLANK.rawValue))] quit=[\(L(BCTL_T_QUIT.rawValue))]\n"
                     s += "blank external=\(bctl_external_count())\n"
                     let b1 = bctl_builtin_blank(true)
                     s += "blank on=\(b1) isBlank=\(bctl_builtin_is_blank())\n"

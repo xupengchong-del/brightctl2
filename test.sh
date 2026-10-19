@@ -1,7 +1,9 @@
 #!/bin/bash
 # test.sh —— brightctl2 自动化验收
 # 会真实读写亮度，结束前把每台屏还原到起始值。
+# 断言依赖中文输出，因此固定语言；另有一段英文冒烟检查。
 set -u
+export BRIGHTCTL_LANG=zh
 BIN="${BIN:-./brightctl2}"
 pass=0; fail=0
 ok()   { echo "  ✓ $1"; pass=$((pass+1)); }
@@ -90,6 +92,15 @@ echo "== 8. 参数与错误处理 =="
 "$BIN" get 0xffff >/dev/null 2>&1; check_eq "$?" 1 "get 不存在 id 退出码"
 "$BIN" bogus >/dev/null 2>&1; check_eq "$?" 2 "未知命令退出码"
 "$BIN" --help >/dev/null 2>&1; check_eq "$?" 0 "--help 退出码"
+
+echo "== 9. 英文输出冒烟 =="
+EN_OUT="$(BRIGHTCTL_LANG=en $BIN --lang en 2>&1)"
+printf '%s
+' "$EN_OUT" | grep -q 'channel=DDC\|channel=DisplayServices' && ok "英文列屏可用" || bad "英文列屏异常: $EN_OUT"
+printf '%s
+' "$EN_OUT" | grep -q 'brightness=' && ok "英文字段完整" || bad "英文字段缺失"
+BRIGHTCTL_LANG=en $BIN --lang en --help 2>&1 | grep -q '^Usage:' && ok "英文 usage" || bad "英文 usage 异常"
+$BIN --lang zh --help 2>&1 | grep -q '用法:' && ok "中文 usage" || bad "中文 usage 异常"
 
 restore_all
 trap - EXIT

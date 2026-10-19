@@ -164,8 +164,16 @@ brightctl2 down [step]    brightness of the primary target display -step (defaul
 brightctl2 sync           align other controllable displays to the primary target
 brightctl2 all <v>        set every controllable display to v
 brightctl2 blank [on|off] blank/restore the built-in display (process must stay alive)
+brightctl2 --lang zh|en   force the output language (default: follow the system)
 brightctl2 --help         usage
 ```
+
+All UI and CLI output is **bilingual (Chinese / English)** and follows the system language by
+default (`zh*` → Chinese, otherwise English):
+
+- CLI: `--lang zh|en`, or the `BRIGHTCTL_LANG` environment variable
+- Menu bar app: a "Language" popup at the bottom of the panel (Automatic / 中文 / English);
+  the choice is remembered
 
 ```text
 $ ./brightctl2

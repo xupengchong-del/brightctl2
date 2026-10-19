@@ -160,8 +160,14 @@ brightctl2 up [step]      主目标屏亮度 +step（默认 5）
 brightctl2 down [step]    主目标屏亮度 -step（默认 5）
 brightctl2 sync           其余可调屏亮度对齐主目标屏
 brightctl2 all <v>        所有可调屏亮度设为 v
+brightctl2 --lang zh|en   手动指定输出语言（默认跟随系统）
 brightctl2 --help         用法
 ```
+
+界面与输出支持**中英双语**，默认跟随系统语言（`zh*` → 中文，其他 → English）：
+
+- 命令行：`--lang zh|en`，或环境变量 `BRIGHTCTL_LANG`
+- 菜单栏应用：面板底部「语言」下拉，可选「跟随系统 / 中文 / English」，选择会被记住
 
 ```text
 $ ./brightctl2
