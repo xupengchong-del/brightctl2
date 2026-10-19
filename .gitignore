@@ -1,0 +1,15 @@
+# 构建产物
+brightctl2
+probe
+probe2
+probe_ddc
+*.o
+BrightCtl.app/
+
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
