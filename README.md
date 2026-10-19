@@ -1,5 +1,7 @@
 # brightctl2 — macOS 亮度控制（CLI + 菜单栏应用）
 
+**中文** | [English](README.en.md)
+
 macOS 亮度控制工具，提供命令行与菜单栏应用两种形态。
 
 在 Apple Silicon 机器上（实测环境：MacBook Pro M3 Pro + 外接 LG UltraFine 作主屏），

@@ -1,0 +1,259 @@
+# brightctl2 — macOS brightness control (CLI + menu bar app)
+
+[中文](README.md) | **English**
+
+A macOS brightness control tool with both a command-line interface and a menu bar app.
+
+On Apple Silicon Macs (tested on MacBook Pro M3 Pro with an LG UltraFine as the main display),
+the classic third-party brightness APIs (`IODisplay*`, `CGDisplayIOServicePort`, `CoreDisplay*`)
+no longer work. This tool uses two system channels that **do work in practice**:
+
+| Channel | Target | Underlying API | Implementation |
+|---|---|---|---|
+| CH1 `DisplayServices` | Built-in / Apple displays | private `DisplayServices.framework` | `dlopen` + `DisplayServicesGet/SetBrightness` |
+| CH2 `DDC/CI over IOAVService` | External displays (HDMI / DP / USB-C / Thunderbolt) | IOKit `IOAVService` + I2C | `DCPAVServiceProxy` → `IOAVServiceWrite/ReadI2C`, VCP 0x10 |
+
+Neither channel needs root or special entitlements — a normally `clang`-compiled binary is enough.
+
+---
+
+## Layout
+
+| File | Purpose |
+|---|---|
+| `brightctl_core.h` / `brightctl_core.c` | Brightness core, shared by CLI and GUI |
+| `brightctl2.c` | Command-line front end |
+| `BrightCtlApp.swift` | Menu bar app (AppKit) |
+| `test.sh` | Acceptance test (really changes brightness, restores on exit) |
+| `Makefile` | `make` / `make app` / `make test` / `make install` |
+| `probe.c` / `probe2.c` / `probe_ddc.c` | Development probes kept for reference |
+
+---
+
+## How it works
+
+Everything below comes from **measuring the system frameworks and protocols directly**:
+reading the exported interfaces of the system frameworks, sending DDC/CI packets per the
+specification, and verifying the read/write round trip on real hardware. No third-party
+application's code or assets are used, copied, or distributed.
+
+### Channel 1: DisplayServices (built-in display)
+
+Brightness of Apple displays is managed by the private framework `DisplayServices.framework`:
+
+```c
+_DisplayServicesSetBrightness(displayID, value);   // value in 0.0 ~ 1.0
+```
+
+i.e. `DisplayServicesGetBrightness` / `DisplayServicesSetBrightness`, taking a float in 0.0–1.0.
+brightctl2 enumerates displays with the public `CGGetActiveDisplayList` API and reads/writes by ID.
+
+### Channel 2: DDC/CI over IOAVService (external display)
+
+External displays expose brightness through their own DDC/CI implementation. On Apple Silicon
+there are no `IOAVService` nodes in the IORegistry, but there are `DCPAVServiceProxy` entries
+with `Location = External`. An `IOAVService` can be created from one of them:
+
+```c
+IOAVServiceRef av = IOAVServiceCreateWithService(kCFAllocatorDefault, proxy);
+```
+
+**Read brightness (VCP 0x10)**
+
+```c
+uint8_t req[4] = {0x82, 0x01, 0x10, 0x00};              // Get VCP 0x10
+IOAVServiceWriteI2C(av, 0x37, 0x51, req, 4);            // chip=0x37, offset=0x51
+usleep(40000);
+uint8_t rep[12];
+IOAVServiceReadI2C(av, 0x37, 0x00, rep, 12);            // offset=0x00
+// reply: 6e 88 02 <result> 10 <type> <max_hi> <max_lo> <cur_hi> <cur_lo> <chk>
+```
+
+**Write brightness (VCP 0x10)**
+
+```c
+uint8_t req[6] = {0x84, 0x03, 0x10, hi, lo, 0};
+req[5] = 0x6e ^ 0x51 ^ req[0] ^ req[1] ^ req[2] ^ req[3] ^ req[4];   // XOR checksum
+IOAVServiceWriteI2C(av, 0x37, 0x51, req, 6);
+```
+
+> **Gotcha**: sending `0x03 0x10 hi lo` (the intuitive "Set VCP") makes
+> `IOAVServiceWriteI2C` return 0 (success), but the display silently ignores it and the value
+> never changes. The packet must carry function code `0x84` and length `0x03`:
+> `84 03 10 hi lo chk`. With that, the change is visible immediately (89 → 81 → 89).
+
+---
+
+## Build
+
+Requires `clang` (Xcode command line tools) plus the system `CoreGraphics` / `IOKit`
+and the private `DisplayServices` framework.
+
+```bash
+cd brightctl2
+make            # build the CLI and the probes
+make app        # build the menu bar app BrightCtl.app
+make test       # build + run the acceptance test
+make install    # install to /Applications and launch
+```
+
+Manual equivalent:
+
+```bash
+clang -O2 -Wall -Wextra -o brightctl2 brightctl2.c brightctl_core.c -ldl \
+      -framework CoreGraphics -framework IOKit -framework CoreFoundation
+```
+
+---
+
+## Menu bar app (BrightCtl.app)
+
+Besides the CLI, the project ships a menu bar app: it lives in the status bar and opens a panel
+when you click the sun icon.
+
+```bash
+make app
+open BrightCtl.app
+make install      # install to /Applications and launch
+```
+
+The panel contains:
+
+- **One row per display**: name (built-in / external / main), current percentage, and a brightness
+  slider that applies while dragging.
+- **Blank built-in display**: hide the internal panel with `CGDisplayCapture`; uncheck to restore.
+  Quitting the app also restores it.
+- **Blank built-in automatically when an external display is connected**: on by default, can be
+  turned off; the choice is remembered.
+- **Launch at login**: registers an `SMAppService` login item.
+- **Quit BrightCtl.**
+
+Implementation notes:
+
+- `NSStatusItem`, with `LSUIElement=true` so it never shows in the Dock.
+- Slider input is throttled to 90 ms (a DDC transaction takes 40–80 ms); the final value on mouse-up
+  is always written.
+- The panel re-reads values every 1.5 s, so changes made with the keyboard brightness keys show up.
+- Capturing a display is tied to the process: if the app exits or crashes, the system releases the
+  capture automatically — no permanently black panel.
+
+### Safety net for the built-in display
+
+If the external display is unplugged while the built-in panel is blacked out, you would be left
+with no usable screen. Three layers prevent that:
+
+1. **Refuse to blank when no external display is present** — `bctl_builtin_blank(true)` counts active
+   external displays first and returns failure when the count is 0; the checkbox is also disabled
+   with an explanation.
+2. **Restore automatically when the external display disappears** — the app registers
+   `CGDisplayRegisterReconfigurationCallback`; whenever displays are added or removed it re-checks and
+   immediately releases the capture if the external count dropped to zero.
+3. **Release on exit** — `CGDisplayCapture` is bound to the process, so the system restores the panel
+   if the app quits or crashes.
+
+---
+
+## Usage (CLI)
+
+```
+brightctl2                list all displays, current brightness, and channel used
+brightctl2 get <id>       read brightness (0-100)
+brightctl2 set <id> <v>   set brightness; v may be 0-100 or +N / -N
+brightctl2 up [step]      brightness of the primary target display +step (default 5)
+brightctl2 down [step]    brightness of the primary target display -step (default 5)
+brightctl2 sync           align other controllable displays to the primary target
+brightctl2 all <v>        set every controllable display to v
+brightctl2 blank [on|off] blank/restore the built-in display (process must stay alive)
+brightctl2 --help         usage
+```
+
+```text
+$ ./brightctl2
+display id=0x2 (main) (external)  brightness=89.0%  channel=DDC
+display id=0x1 (built-in)  brightness=56.0%  channel=DisplayServices
+```
+
+**Primary target** selection: the main display if it is controllable, otherwise the first
+controllable display. On the tested machine the main display is the external LG UltraFine, so
+`up` / `down` / `sync` act on the display you are actually looking at.
+
+Exit codes: `0` success, `1` runtime failure (cannot read/write/find the display), `2` usage error.
+
+---
+
+## Tests
+
+```bash
+make test
+```
+
+`test.sh` really changes brightness and covers 23 assertions, restoring every display to its
+starting value when it exits:
+
+1. enumeration (display count, controllable count)
+2. `get` returns a value within 0–100
+3. `set` absolute round trip, `+N` / `-N` relative steps
+4. `set 100` / `set 0` clamping
+5. `up` / `down` effect and restore
+6. `sync` consistency (±2 tolerance)
+7. `all` batch set
+8. exit codes for bad input (missing args, non-numeric, out of range, unknown id, unknown command, `--help`)
+
+---
+
+## Measured on real hardware (2026-10-19, macOS 26.6.2 / Apple M3 Pro)
+
+1. **DisplayServices**: `dlopen` succeeds, `GetBrightness` / `SetBrightness` are exported; the
+   built-in display (id=0x1) reads and writes normally, no entitlement required.
+2. **DDC**: two `DCPAVServiceProxy` entries exist (External / Embedded); creating an `IOAVService`
+   from the External one yields a 256-byte EDID, VCP 0x10 is readable, and `84 03 10 ...` writes
+   take effect and read back (89 → 81 → 89).
+3. `PowerMode` is not available on the built-in display (`HasPowerMode=0`), so the software path is
+   `CGDisplayCapture` rather than a power switch.
+
+---
+
+## Known limitations
+
+- **Multi-external-display matching**: `CGDirectDisplayID` ↔ `DCPAVServiceProxy` is matched by
+  IORegistry order. Verified with a single external display; with two or more, an incorrect order
+  could send a brightness change to the wrong display (EDID-based matching is not implemented yet).
+- **Different scales**: `DisplayServices` uses a 0–1 UI brightness, DDC uses the display's own
+  0–max scale. `sync` can only align percentages; the perceived brightness may not match exactly.
+- **Auto-brightness on the built-in display**: ambient light changes make readings drift
+  (observed 65% → 72%), and a `set` may be adjusted by the system afterwards.
+- **DDC is slow**: each transaction waits 40–80 ms; repeated `set` calls are noticeably slow.
+- **Private APIs**: `DisplayServices` and `IOAVService` are not public interfaces and may break in a
+  future macOS release.
+- **Sleep / hot-plug**: an `IOAVService` handle may become invalid after sleep or unplugging; just
+  run the command again.
+
+---
+
+## Contributing
+
+- **Issues are disabled**: this project does not accept bug reports or feature requests. If you need
+  a change, fork the repository or download the code and modify it yourself.
+- **Pull requests are welcome**: improvements may be submitted and will be reviewed as time permits,
+  but merging is not guaranteed. Changes touching private interfaces need verification on real
+  hardware first.
+- The project has only been verified on one Apple Silicon machine with an LG UltraFine external
+  display. Behaviour on other display models is unknown and is expected to differ.
+
+---
+
+## License and disclaimer
+
+- Released under the [MIT](LICENSE) license.
+- The tool calls undocumented macOS interfaces (`DisplayServices`, `IOAVService`) and the DDC/CI
+  protocol. These are not supported by Apple, **may break at any system update**, and may cause
+  unexpected display behaviour. Use at your own risk. Such usage is not eligible for the Mac App
+  Store; the project is intended for developers who build it themselves.
+- DDC/CI writes VCP 0x10 to the display. Some panels are sensitive to non-standard timing.
+- This project is not affiliated with, or endorsed by, any third-party commercial software.
+
+## Roadmap
+
+1. **EDID-based matching for multiple external displays**, replacing the current order heuristic.
+2. **Launch at login / scheduled restore** via launchd.
+3. **More UI work**: menu bar panel refinement (larger scope, needs its own evaluation).
