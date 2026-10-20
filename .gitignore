@@ -1,8 +1,5 @@
 # 构建产物
 brightctl2
-probe
-probe2
-probe_ddc
 *.o
 BrightCtl.app/
 
@@ -13,3 +10,6 @@ BrightCtl.app/
 .vscode/
 .idea/
 *.swp
+probe
+probe2
+probe_ddc

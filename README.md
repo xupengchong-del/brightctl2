@@ -28,11 +28,7 @@ macOS 亮度控制工具，提供命令行与菜单栏应用两种形态。
 | `BrightCtl.app` | 菜单栏应用产物（双击启动） |
 | `test.sh` | 自动化验收脚本（真实读写亮度，结束自动还原） |
 | `Makefile` | `make` / `make test` / `make clean` |
-| `probe.c` / `probe` | 第一步探测：DisplayServices 能否 dlopen、符号是否导出 |
-| `probe2.c` / `probe2` | 第二步探测：`CGGetActiveDisplayList` 枚举 + DisplayServices 读写实测 |
-| `probe_ddc.c` / `probe_ddc` | 第三步探测：`DCPAVServiceProxy` → `IOAVService` → DDC/CI 读写实测 |
 
-> `probe*` 是开发过程的验证中间产物，保留供追溯；日常使用只需 `brightctl2`。
 
 ---
 
@@ -94,7 +90,7 @@ IOAVServiceWriteI2C(av, 0x37, 0x51, req, 6);
 
 ```bash
 cd brightctl2
-make            # 构建 brightctl2 与三个 probe
+make            # 构建 brightctl2
 make app        # 构建菜单栏应用 BrightCtl.app
 make test       # 构建 + 跑验收脚本
 make install    # 安装到 /Applications 并启动

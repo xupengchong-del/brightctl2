@@ -4,24 +4,14 @@ CFLAGS  ?= -O2 -Wall -Wextra
 LDFLAGS  = -ldl -framework CoreGraphics -framework IOKit -framework CoreFoundation
 
 BIN     = brightctl2
-PROBES  = probe probe2 probe_ddc
 APP     = BrightCtl.app
 
 .PHONY: all app test clean install
 
-all: $(BIN) $(PROBES)
+all: $(BIN)
 
 $(BIN): brightctl2.c brightctl_core.c brightctl_core.h
 	$(CC) $(CFLAGS) -o $@ brightctl2.c brightctl_core.c $(LDFLAGS)
-
-probe: probe.c
-	$(CC) $(CFLAGS) -o $@ $< -ldl -framework CoreGraphics
-
-probe2: probe2.c
-	$(CC) $(CFLAGS) -o $@ $< -ldl -framework CoreGraphics
-
-probe_ddc: probe_ddc.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # 菜单栏应用：Swift 壳 + C 核心
 app: $(APP)
@@ -52,5 +42,5 @@ install: $(APP)
 	/usr/bin/open /Applications/$(APP)
 
 clean:
-	rm -f $(BIN) $(PROBES)
+	rm -f $(BIN)
 	rm -rf $(APP)

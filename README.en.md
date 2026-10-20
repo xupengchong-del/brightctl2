@@ -26,7 +26,6 @@ Neither channel needs root or special entitlements — a normally `clang`-compil
 | `BrightCtlApp.swift` | Menu bar app (AppKit) |
 | `test.sh` | Acceptance test (really changes brightness, restores on exit) |
 | `Makefile` | `make` / `make app` / `make test` / `make install` |
-| `probe.c` / `probe2.c` / `probe_ddc.c` | Development probes kept for reference |
 
 ---
 
@@ -91,7 +90,7 @@ and the private `DisplayServices` framework.
 
 ```bash
 cd brightctl2
-make            # build the CLI and the probes
+make            # build the CLI
 make app        # build the menu bar app BrightCtl.app
 make test       # build + run the acceptance test
 make install    # install to /Applications and launch
