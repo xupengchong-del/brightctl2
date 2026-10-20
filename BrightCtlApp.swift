@@ -545,9 +545,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 显示器休眠期间不要动捕获状态：休眠会改变 active 列表，
         // 此时任何判断都不可靠，等唤醒后再说。
         if bctl_displays_asleep() { return }
+        if isApplying { return }
         let ext = bctl_external_count()
         let blanked = bctl_builtin_is_blank()
         var action = "none"
+
+        isApplying = true
+        defer {
+            isApplying = false
+            // 自己改了显示配置，给系统回调一点冷静时间
+            if action != "none" { suppressUntil = Date().addingTimeInterval(1.5) }
+        }
 
         if ext == 0 {
             if blanked {
@@ -568,7 +576,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 显示器增删/启停后调用：外屏没了就强制恢复内屏
+    /// 正在执行断开/接回时不响应重配置回调，避免自己触发自己
+    private var isApplying = false
+    /// 自己改动显示配置后，系统会异步回调若干次；这段冷却期内忽略
+    private var suppressUntil: Date = .distantPast
+
     func handleDisplaysChanged() {
+        if isApplying || Date() < suppressUntil { return }
         _ = bctl_probe(nil, 0)
         applyAutoBlankIfNeeded()
         panel.reload()

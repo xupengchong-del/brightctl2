@@ -121,8 +121,15 @@ The panel contains:
 
 - **One row per display**: name (built-in / external / main), current percentage, and a brightness
   slider that applies while dragging.
-- **Blank built-in display**: hide the internal panel with `CGDisplayCapture`; uncheck to restore.
-  Quitting the app also restores it.
+- **Blank built-in display**: detach the internal panel from the system (as if unplugged);
+  uncheck or quit the app to bring it back.
+
+> Earlier versions used `CGDisplayCapture`, which has heavy side effects: a captured display
+> cannot take part in normal WindowServer compositing, so **the system screenshot shortcut
+> silently stops working**, and the display cannot sleep or lock normally. The app now uses a
+> display configuration transaction (`CGBeginDisplayConfiguration` + `SLSConfigureDisplayEnabled`)
+> to actually detach the built-in panel, leaving screenshots, lock and sleep untouched.
+> The display id is persisted to disk, so a crash or restart can still restore it.
 - **Blank built-in automatically when an external display is connected**: on by default, can be
   turned off; the choice is remembered.
 - **Launch at login**: registers an `SMAppService` login item.

@@ -341,10 +341,105 @@ bool bctl_is_builtin(uint32_t display_id) {
     return e && e->is_builtin;
 }
 
-/* ---------- 内屏黑屏（CGDisplayCapture） ---------- */
+/* ---------- 内屏关闭（显示配置事务） ----------
+ *
+ * 早期用 CGDisplayCapture 独占内屏，副作用很重：被捕获的显示器无法正常参与
+ * WindowServer 合成，系统截图快捷键会静默失效，显示器也无法正常休眠/锁屏。
+ *
+ * 改用显示配置事务把内屏「断开」：内屏会从 online 列表消失，就像拔掉了显示器，
+ * 截图、锁屏、休眠全部保持系统原生行为。
+ *
+ * 注意：断开后内屏不在 online 列表里，无法再从系统枚举出它的 id，
+ * 因此断开时把 id 落盘，恢复时据此接回；进程退出也不会让内屏永久消失。
+ */
 
 static CGDirectDisplayID g_blank_id;
 static bool g_blanked;
+
+typedef int (*ConfigureDisplayEnabled_fn)(CGDisplayConfigRef, CGDirectDisplayID, int);
+
+static ConfigureDisplayEnabled_fn g_configure_enabled;
+
+static bool load_configure_display_enabled(void) {
+    if (g_configure_enabled) return true;
+    void *h = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight",
+                     RTLD_LAZY);
+    if (!h) return false;
+    g_configure_enabled = (ConfigureDisplayEnabled_fn)dlsym(h, "SLSConfigureDisplayEnabled");
+    return g_configure_enabled != NULL;
+}
+
+/* 提交一次显示配置事务；enabled=false 表示断开该显示器 */
+static bool apply_display_enabled(CGDirectDisplayID id, bool enabled) {
+    if (!load_configure_display_enabled()) return false;
+
+    CGDisplayConfigRef config = NULL;
+    if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess || !config) return false;
+
+    int r = g_configure_enabled(config, id, enabled ? 1 : 0);
+    if (r != 0) {
+        CGCancelDisplayConfiguration(config);
+        return false;
+    }
+    if (CGCompleteDisplayConfiguration(config, kCGConfigurePermanently) != kCGErrorSuccess)
+        return false;
+    return true;
+}
+
+/* 断开状态落盘，避免进程退出后内屏再也接不回来 */
+static void state_path(char *buf, size_t len) {
+    snprintf(buf, len, "/tmp/.brightctl-blanked-%d", (int)getuid());
+}
+
+static void remember_blanked(CGDirectDisplayID id) {
+    char path[64];
+    state_path(path, sizeof path);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "0x%x\n", id);
+    fclose(f);
+}
+
+static void forget_blanked(void) {
+    char path[64];
+    state_path(path, sizeof path);
+    unlink(path);
+}
+
+static CGDirectDisplayID recall_blanked(void) {
+    char path[64];
+    state_path(path, sizeof path);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned int id = 0;
+    int got = fscanf(f, "%x", &id);
+    fclose(f);
+    return got == 1 ? (CGDirectDisplayID)id : 0;
+}
+
+/* 内屏当前是否仍存在于系统中 */
+static bool builtin_present(void) {
+    CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
+    uint32_t n = 0;
+    if (CGGetOnlineDisplayList(BCTL_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess) return false;
+    for (uint32_t i = 0; i < n; i++)
+        if (CGDisplayIsBuiltin(ids[i])) return true;
+    return false;
+}
+
+/* 找到内建屏 id（优先缓存，其次 online 枚举） */
+static CGDirectDisplayID find_builtin_display(void) {
+    for (int i = 0; i < g_count; i++)
+        if (g_entries[i].is_builtin) return g_entries[i].id;
+
+    CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
+    uint32_t n = 0;
+    if (CGGetOnlineDisplayList(BCTL_MAX_DISPLAYS, ids, &n) == kCGErrorSuccess) {
+        for (uint32_t i = 0; i < n; i++)
+            if (CGDisplayIsBuiltin(ids[i])) return ids[i];
+    }
+    return 0;
+}
 
 int bctl_external_count(void) {
     /* 仅供自动化测试模拟「没有外接显示器」的场景 */
@@ -372,45 +467,51 @@ bool bctl_displays_asleep(void) {
 bool bctl_builtin_blank(bool blank) {
     if (blank) {
         if (bctl_builtin_is_blank()) return true;
-        /* 安全阀：没有外接显示器时绝不能黑掉内屏，否则用户没有任何画面 */
+        /* 安全阀：没有外接显示器时绝不能关掉内屏，否则用户没有任何画面 */
         if (bctl_external_count() == 0) return false;
-        CGDirectDisplayID target = 0;
-        for (int i = 0; i < g_count; i++)
-            if (g_entries[i].is_builtin) { target = g_entries[i].id; break; }
-        if (!target) {
-            /* 缓存未初始化时直接按 CG 枚举找内建屏 */
-            CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
-            uint32_t n = 0;
-            if (CGGetActiveDisplayList(BCTL_MAX_DISPLAYS, ids, &n) == kCGErrorSuccess) {
-                for (uint32_t i = 0; i < n; i++)
-                    if (CGDisplayIsBuiltin(ids[i])) { target = ids[i]; break; }
-            }
-        }
+        CGDirectDisplayID target = find_builtin_display();
         if (!target) return false;
-        if (CGDisplayCapture(target) != kCGErrorSuccess) return false;
+        if (!apply_display_enabled(target, false)) return false;
         g_blank_id = target;
         g_blanked = true;
+        remember_blanked(target);
         return true;
     }
-    if (!g_blanked) return true;
-    CGDisplayRelease(g_blank_id);
-    g_blanked = false;
-    g_blank_id = 0;
-    return true;
-}
 
-bool bctl_builtin_is_blank(void) {
-    if (!g_blanked) return false;
-    /* 显示器休眠/唤醒时系统可能自行释放捕获，这里以真实状态为准，
-     * 否则会一直以为还黑着而不去补。 */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    if (g_blank_id && !CGDisplayIsCaptured(g_blank_id)) {
+    /* 恢复：即使本进程没记录过状态，只要磁盘上有记录就接回来 */
+    CGDirectDisplayID target = g_blanked ? g_blank_id : recall_blanked();
+    if (!target) {
+        if (builtin_present()) { forget_blanked(); g_blanked = false; g_blank_id = 0; return true; }
+        return false;
+    }
+    if (builtin_present()) {
+        forget_blanked();
+        g_blanked = false;
+        g_blank_id = 0;
+        return true;
+    }
+    bool ok = apply_display_enabled(target, true);
+    if (ok) {
+        forget_blanked();
         g_blanked = false;
         g_blank_id = 0;
     }
-#pragma clang diagnostic pop
-    return g_blanked;
+    return ok;
+}
+
+bool bctl_builtin_is_blank(void) {
+    /* 以系统真实状态 + 落盘记录为准：
+     * 内屏不在 online 列表里，且有记录，才算「已关闭」。 */
+    if (builtin_present()) {
+        if (g_blanked) { g_blanked = false; g_blank_id = 0; }
+        forget_blanked();
+        return false;
+    }
+    CGDirectDisplayID id = g_blanked ? g_blank_id : recall_blanked();
+    if (!id) return false;
+    g_blank_id = id;
+    g_blanked = true;
+    return true;
 }
 
 /* ---------- 本地化 ---------- */
