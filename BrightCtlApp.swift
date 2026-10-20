@@ -65,7 +65,7 @@ enum LoginItem {
 // MARK: - 写入节流（DDC 每次 40~80ms，拖动时不能每个像素都发）
 
 final class BrightWriter {
-    private let queue = DispatchQueue(label: "brightctl.write", qos: .userInitiated)
+    private let queue = DispatchQueue.main // 与探测/黑屏配置串行，避免使用被释放的 DDC 句柄
     private var lastWrite: [UInt32: Date] = [:]
     private let lock = NSLock()
 
@@ -331,7 +331,7 @@ final class PanelViewController: NSViewController {
         applyTexts()
         let ext = bctl_external_count()
         blankCheck.state = bctl_builtin_is_blank() ? .on : .off
-        blankCheck.isEnabled = ext > 0
+        blankCheck.isEnabled = ext > 0 || bctl_builtin_has_restore_state()
         blankCheck.toolTip = ext > 0
             ? "关闭内建屏显示（已检测到 \(ext) 台外接显示器）"
             : "未检测到外接显示器，关闭内屏后将没有任何画面"
@@ -345,6 +345,7 @@ final class PanelViewController: NSViewController {
     }
 
     private func refresh() {
+        guard view.window?.isVisible == true, !bctl_displays_asleep() else { return }
         var buf = [bctl_display](repeating: bctl_display(), count: Int(BCTL_MAX_DISPLAYS))
         let n = buf.withUnsafeMutableBufferPointer { ptr -> Int in
             Int(bctl_refresh(ptr.baseAddress, Int32(BCTL_MAX_DISPLAYS)))
@@ -439,6 +440,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private let panel = PanelViewController()
+    private var screenLocked = false
+    private var screensSleeping = false
+    private var terminating = false
+    private var lastExternalIDs: Set<UInt32> = []
+    private var topologyGeneration = 0
+    private var observers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         bctl_set_language((Prefs.language as NSString).utf8String)
@@ -484,14 +491,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             log += String(format: "  id=0x%x main=%d builtin=%d channel=%d percent=%.1f\n",
                           d.display_id, d.is_main ? 1 : 0, d.is_builtin ? 1 : 0, d.channel, d.percent)
         }
-        // 启动即按当前外屏情况执行一次（自检模式除外，避免干扰）
-        if !ProcessInfo.processInfo.arguments.contains("--selftest") {
-            applyAutoBlankIfNeeded()
-
-            // 看门狗：显示器休眠/唤醒会让系统释放捕获，这里定期补回来。
-            // 只读 CG 状态，不触发 DDC，开销很小。
+        if !args.contains("--selftest") {
+            observePowerAndSession()
+            lastExternalIDs = externalIDs()
+            // 重启时先恢复未完成快照，再按当前开关决定是否重新黑屏。
+            let recovered = !bctl_builtin_has_restore_state() || bctl_builtin_blank(false)
+            if recovered { applyAutoBlankIfNeeded() }
             Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-                self?.applyAutoBlankIfNeeded()
+                // 兜底只恢复，不反复强制关闭内屏。
+                self?.applyAutoBlankIfNeeded(allowBlank: false)
             }
         }
 
@@ -521,7 +529,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     _ = bctl_builtin_blank(true)
                     let pre = bctl_builtin_is_blank()
                     setenv("BRIGHTCTL_TEST_NO_EXTERNAL", "1", 1)
-                    self.handleDisplaysChanged()
+                    self.applyAutoBlankIfNeeded()
                     let post = bctl_builtin_is_blank()
                     unsetenv("BRIGHTCTL_TEST_NO_EXTERNAL")
                     s += "autoRecover preBlank=\(pre) postBlank=\(post) expect post=false\n"
@@ -539,55 +547,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var lastDecision = ""
+    private var isApplying = false
 
-    /// 统一处理内屏开关：有外屏且开启自动 → 关内屏；无外屏 → 必开内屏
-    func applyAutoBlankIfNeeded() {
-        // 显示器休眠期间不要动捕获状态：休眠会改变 active 列表，
-        // 此时任何判断都不可靠，等唤醒后再说。
-        if bctl_displays_asleep() { return }
-        if isApplying { return }
+    private func externalIDs() -> Set<UInt32> {
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(BCTL_MAX_DISPLAYS))
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(UInt32(ids.count), &ids, &count) == .success else { return lastExternalIDs }
+        return Set(ids.prefix(Int(count)).filter { CGDisplayIsBuiltin($0) == 0 })
+    }
+
+    private func observePowerAndSession() {
+        let nc = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.screensDidSleepNotification, NSWorkspace.willSleepNotification] {
+            observers.append(nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.screensSleeping = true
+            })
+        }
+        for name in [NSWorkspace.screensDidWakeNotification, NSWorkspace.didWakeNotification] {
+            observers.append(nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.screensSleeping = false
+                self?.scheduleTopologyCheck(afterWake: true)
+            })
+        }
+        let dn = DistributedNotificationCenter.default()
+        observers.append(dn.addObserver(forName: NSNotification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.screenLocked = true
+            self?.popover.performClose(nil)
+        })
+        observers.append(dn.addObserver(forName: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.screenLocked = false
+            self?.scheduleTopologyCheck(afterWake: true)
+        })
+    }
+
+    /// 恢复优先；关闭动作仅在启动/插拔/唤醒后进行，不由定时器反复强制执行。
+    func applyAutoBlankIfNeeded(allowBlank: Bool = true) {
+        guard !terminating, !isApplying else { return }
+        // 锁屏/睡眠时不提交任何显示配置，即使拔线也保留快照待解锁/唤醒恢复。
+        if screenLocked || screensSleeping || bctl_displays_asleep() { return }
         let ext = bctl_external_count()
-        let blanked = bctl_builtin_is_blank()
+        guard ext >= 0 else { return } // 查询失败不是拔线
+        let pending = bctl_builtin_has_restore_state()
         var action = "none"
-
         isApplying = true
-        defer {
-            isApplying = false
-            // 自己改了显示配置，给系统回调一点冷静时间
-            if action != "none" { suppressUntil = Date().addingTimeInterval(1.5) }
-        }
-
-        if ext == 0 {
-            if blanked {
-                _ = bctl_builtin_blank(false)
-                action = "restore(no-external)"
+        defer { isApplying = false }
+        if ext == 0 && pending {
+            let ok = bctl_builtin_blank(false)
+            action = ok ? "restore(no-external)" : "restore-failed(no-external)"
+        } else if ext > 0 && allowBlank && !screenLocked && !screensSleeping && !bctl_displays_asleep() {
+            if Prefs.autoBlankBuiltin && !bctl_builtin_is_blank() {
+                let ok = bctl_builtin_blank(true)
+                action = ok ? "blank(auto)" : "blank-failed(auto)"
             }
-        } else if Prefs.autoBlankBuiltin && !blanked {
-            _ = bctl_builtin_blank(true)
-            action = "blank(auto)"
         }
-
-        // 只在状态变化时记一行，方便回溯真实场景
-        let decision = "ext=\(ext) blanked=\(blanked) auto=\(Prefs.autoBlankBuiltin) action=\(action)"
+        let decision = "ext=\(ext) pending=\(pending) auto=\(Prefs.autoBlankBuiltin) action=\(action)"
         if decision != lastDecision {
             lastDecision = decision
             logLine("autoBlank " + decision)
         }
     }
 
-    /// 显示器增删/启停后调用：外屏没了就强制恢复内屏
-    /// 正在执行断开/接回时不响应重配置回调，避免自己触发自己
-    private var isApplying = false
-    /// 自己改动显示配置后，系统会异步回调若干次；这段冷却期内忽略
-    private var suppressUntil: Date = .distantPast
-
-    func handleDisplaysChanged() {
-        if isApplying || Date() < suppressUntil { return }
-        _ = bctl_probe(nil, 0)
-        applyAutoBlankIfNeeded()
-        panel.reload()
-        logLine("displaysChanged external=\(bctl_external_count()) blanked=\(bctl_builtin_is_blank())")
+    private func scheduleTopologyCheck(afterWake: Bool = false) {
+        guard !terminating else { return }
+        topologyGeneration += 1
+        let generation = topologyGeneration
+        // 合并重配置事件，再有限次确认；镜像自身产生的回调不会再次强制黑屏。
+        for delay in [0.35, 1.0, 3.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, !self.terminating, self.topologyGeneration == generation else { return }
+                let now = self.externalIDs()
+                let changed = now != self.lastExternalIDs
+                self.lastExternalIDs = now
+                self.applyAutoBlankIfNeeded(allowBlank: changed || afterWake)
+                if self.popover.isShown && !self.screenLocked && !self.screensSleeping {
+                    self.panel.reload()
+                }
+            }
+        }
     }
+
+    func handleDisplaysChanged() { scheduleTopologyCheck() }
 
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
@@ -601,6 +640,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        terminating = true
+        topologyGeneration += 1
         CGDisplayRemoveReconfigurationCallback(
             brightctlDisplayChanged,
             Unmanaged.passUnretained(self).toOpaque()

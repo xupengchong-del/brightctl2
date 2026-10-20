@@ -122,33 +122,22 @@ make install      # 装进 /Applications 并启动
 面板内容：
 
 - **每块显示器一行**：名称（内建/外接/主屏）、当前百分比、亮度滑块，拖动即时生效
-- **关闭内建屏**：勾选后内建屏从系统里断开（等同拔掉），取消勾选或退出应用即恢复。
-
-> 早期版本用 `CGDisplayCapture` 独占内屏，副作用很重：被捕获的屏幕无法正常参与
-> WindowServer 合成，**系统截图快捷键会静默失效**，显示器也无法正常休眠/锁屏。
-> 现在改用显示配置事务（`CGBeginDisplayConfiguration` + `SLSConfigureDisplayEnabled`）
-> 真正把内屏断开，截图、锁屏、休眠全部保持系统原生行为。
-> 断开时会把内屏 id 落盘，进程崩溃或退出后再启动也能接回来。
+- **关闭内建屏**：内屏镜像到外屏并将背光亮度降到 0；取消勾选或拔掉外屏后恢复原设置。
 - **开机自动启动**：勾选注册为登录项（SMAppService），取消即注销
 - **退出 BrightCtl**
 
-### 内屏安全保护
+### 内屏恢复
 
-内屏黑屏后如果外接屏被拔掉，你会没有任何可操作的画面。所以做了三层保护：
+内屏不会从系统显示列表中移除，也不会被进程独占。应用保存原亮度、自动亮度和镜像状态；镜像或亮度操作失败时回滚。物理拔掉外屏后恢复快照；锁屏和睡眠期间不提交显示配置，解锁/唤醒后再处理待恢复状态。
 
-1. **没有外屏时直接拒绝黑屏**：`bctl_builtin_blank(true)` 会先数一遍活动外接屏，为 0 就返回失败，面板上的勾选框也会置灰并给出提示。
-2. **外屏断开时自动恢复**：应用注册了 `CGDisplayRegisterReconfigurationCallback`，任何显示器增删/启停都会触发检查；一旦外接屏数量归零且内屏仍是黑屏状态，立即释放捕获。
-3. **进程退出自动释放**：`CGDisplayCapture` 与进程绑定，应用崩溃或退出后系统会自己恢复内屏，不会留下黑屏。
-
-实测（`--selftest`）：`blank on=true isBlank=true` → `blank off=true isBlank=false`；
-模拟无外屏时 `guard blank=false`；模拟「已黑屏 + 外屏消失」时 `autoRecover preBlank=true postBlank=false`。
+亮度归零关闭的是背光，不是面板硬件断电。若原来启用了自动亮度，恢复后传感器会按环境光重新调节，因此最终百分比可能与关闭前不同。
 
 实现要点：
 
 - 用 `NSStatusItem` 挂在系统状态栏，`LSUIElement=true` 所以不占 Dock、不抢前台。
 - 滑块拖动做 90ms 节流（DDC 每次事务 40–80ms），松手时强制写入最终值。
 - 面板每 1.5 秒回读一次，外部改了亮度（比如按键盘亮度键）也能同步显示。
-- 内屏黑屏用公共 API `CGDisplayCapture`；它和进程绑定，进程退出系统会自动释放，不会留下黑屏。
+- 内屏使用公开镜像配置和 DisplayServices 背光亮度；不调用 `CGDisplayCapture` 或私有禁用显示器 API。
 
 > 界面验证说明：本机未授予终端「屏幕录制」与「辅助功能」权限，因此无法由我截图核对外观；
 > 已通过应用内日志确认 `bctl_probe` 在 GUI 进程里正确返回 2 块屏（0x2→DDC、0x1→DisplayServices）
@@ -166,6 +155,7 @@ brightctl2 up [step]      主目标屏亮度 +step（默认 5）
 brightctl2 down [step]    主目标屏亮度 -step（默认 5）
 brightctl2 sync           其余可调屏亮度对齐主目标屏
 brightctl2 all <v>        所有可调屏亮度设为 v
+brightctl2 blank [on|off] 镜像内屏并关闭背光/恢复（退出时自动恢复）
 brightctl2 --lang zh|en   手动指定输出语言（默认跟随系统）
 brightctl2 --help         用法
 ```
@@ -195,7 +185,7 @@ display id=0x1 (内建)  brightness=56.0%  channel=DisplayServices
 make test
 ```
 
-`test.sh` 会真实读写亮度，覆盖 23 项断言，结束前把每台屏还原到起始值：
+`test.sh` 会真实读写亮度，覆盖 27 项 CLI 断言，结束前把每台屏还原到起始值。另有 18 项不接触硬件的关闭/恢复故障测试：
 
 1. 枚举（屏数、可控屏数）
 2. `get` 返回值落在 0–100
@@ -206,7 +196,9 @@ make test
 7. `all` 批量设置
 8. 错误路径退出码（缺参、非数字、超范围、不存在 id、未知命令、`--help`）
 
-实测输出（2026-10-19，本机）：
+真机闭环验证：内屏保持在线且未被捕获，镜像并将背光归零后，命令行截图和原生 Cmd-Shift-3 均成功；CLI 收到 SIGTERM 后恢复镜像、位置和自动亮度。开启自动亮度时，恢复后的百分比由环境光传感器决定，可能不同于关闭前的数值。
+
+CLI 测试输出（2026-10-20，本机）：
 
 ```text
 == 1. 枚举 ==
@@ -215,7 +207,7 @@ display id=0x1 (内建)  brightness=56.0%  channel=DisplayServices
   ✓ 枚举到 2 台屏
   ✓ 2 台可控
 ...
-通过 23 项，失败 0 项
+通过 27 项，失败 0 项
 ```
 
 ---

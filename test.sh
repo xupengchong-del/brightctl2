@@ -45,7 +45,7 @@ done
 echo "== 3. set 绝对/相对读写闭环 =="
 for j in "${!IDS[@]}"; do
   id="${IDS[$j]}"; start="$(printf '%.0f' "${RESTORE[$j]}")"
-  if [ "$start" -ge 50 ]; then target=$((start-4)); rel=-3; else target=$((start+4)); rel=3; fi
+  if [ "$start" -ge 50 ]; then target=$((start-4)); rel=-3; else target=$((start+4)); rel=+3; fi
   "$BIN" set "$id" "$target" >/dev/null
   after="$($BIN get "$id")"
   check_range "$after" $((target-1)) $((target+1)) "set $id $target 后读回"

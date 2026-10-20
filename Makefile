@@ -40,6 +40,12 @@ $(APP): BrightCtlApp.swift brightctl_core.c brightctl_core.h BrightCtl-Info.plis
 test: $(BIN)
 	./test.sh
 
+# 不接触硬件的关闭/恢复故障测试（CG、DisplayServices、偏好均被替换）
+blank-failure-test:
+	$(CC) -O0 -Wall -Wextra -I. tests/blank_failure_test.c -o /tmp/brightctl-blank-failure-test \
+	  -framework CoreGraphics -framework CoreFoundation -framework IOKit -ldl
+	/tmp/brightctl-blank-failure-test
+
 install: $(APP)
 	rm -rf /Applications/$(APP)
 	cp -R $(APP) /Applications/

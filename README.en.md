@@ -121,15 +121,7 @@ The panel contains:
 
 - **One row per display**: name (built-in / external / main), current percentage, and a brightness
   slider that applies while dragging.
-- **Blank built-in display**: detach the internal panel from the system (as if unplugged);
-  uncheck or quit the app to bring it back.
-
-> Earlier versions used `CGDisplayCapture`, which has heavy side effects: a captured display
-> cannot take part in normal WindowServer compositing, so **the system screenshot shortcut
-> silently stops working**, and the display cannot sleep or lock normally. The app now uses a
-> display configuration transaction (`CGBeginDisplayConfiguration` + `SLSConfigureDisplayEnabled`)
-> to actually detach the built-in panel, leaving screenshots, lock and sleep untouched.
-> The display id is persisted to disk, so a crash or restart can still restore it.
+- **Blank built-in display**: mirror the built-in panel to the external display and set its backlight to 0; uncheck or unplug the external display to restore its saved settings.
 - **Blank built-in automatically when an external display is connected**: on by default, can be
   turned off; the choice is remembered.
 - **Launch at login**: registers an `SMAppService` login item.
@@ -141,22 +133,13 @@ Implementation notes:
 - Slider input is throttled to 90 ms (a DDC transaction takes 40–80 ms); the final value on mouse-up
   is always written.
 - The panel re-reads values every 1.5 s, so changes made with the keyboard brightness keys show up.
-- Capturing a display is tied to the process: if the app exits or crashes, the system releases the
-  capture automatically — no permanently black panel.
+- The built-in panel uses public mirroring configuration and DisplayServices backlight control; the app does not call `CGDisplayCapture` or private display-disable APIs.
 
-### Safety net for the built-in display
+### Built-in display recovery
 
-If the external display is unplugged while the built-in panel is blacked out, you would be left
-with no usable screen. Three layers prevent that:
+The built-in display stays in the system display list and is never captured or disabled. BrightCtl saves its original brightness, auto-brightness, and mirror state; a failed mirror or brightness operation is rolled back. Unplugging the external display restores the saved state. While the screen is locked or asleep, display configuration changes are deferred until unlock/wake.
 
-1. **Refuse to blank when no external display is present** — `bctl_builtin_blank(true)` counts active
-   external displays first and returns failure when the count is 0; the checkbox is also disabled
-   with an explanation.
-2. **Restore automatically when the external display disappears** — the app registers
-   `CGDisplayRegisterReconfigurationCallback`; whenever displays are added or removed it re-checks and
-   immediately releases the capture if the external count dropped to zero.
-3. **Release on exit** — `CGDisplayCapture` is bound to the process, so the system restores the panel
-   if the app quits or crashes.
+Brightness 0 turns off the backlight, not the panel's hardware power. If auto-brightness was enabled, the ambient sensor may choose a different brightness after restoration, so the final percentage can differ from the value before blanking.
 
 ---
 
@@ -170,7 +153,7 @@ brightctl2 up [step]      brightness of the primary target display +step (defaul
 brightctl2 down [step]    brightness of the primary target display -step (default 5)
 brightctl2 sync           align other controllable displays to the primary target
 brightctl2 all <v>        set every controllable display to v
-brightctl2 blank [on|off] blank/restore the built-in display (process must stay alive)
+brightctl2 blank [on|off] mirror and darken/restore built-in (restores on exit)
 brightctl2 --lang zh|en   force the output language (default: follow the system)
 brightctl2 --help         usage
 ```
@@ -202,8 +185,8 @@ Exit codes: `0` success, `1` runtime failure (cannot read/write/find the display
 make test
 ```
 
-`test.sh` really changes brightness and covers 23 assertions, restoring every display to its
-starting value when it exits:
+`test.sh` really changes brightness and covers 27 CLI assertions, restoring every display to its
+starting value when it exits. A separate hardware-free suite covers 18 blank/restore failure scenarios:
 
 1. enumeration (display count, controllable count)
 2. `get` returns a value within 0–100
@@ -214,6 +197,8 @@ starting value when it exits:
 7. `all` batch set
 8. exit codes for bad input (missing args, non-numeric, out of range, unknown id, unknown command, `--help`)
 
+A real-machine check verified that the built-in stays online and uncaptured, native Cmd-Shift-3 creates a screenshot, and SIGTERM restores brightness, mirroring, and position. When auto-brightness is enabled, the ambient sensor may choose a different final brightness.
+
 ---
 
 ## Measured on real hardware (2026-10-19, macOS 26.6.2 / Apple M3 Pro)
@@ -223,8 +208,7 @@ starting value when it exits:
 2. **DDC**: two `DCPAVServiceProxy` entries exist (External / Embedded); creating an `IOAVService`
    from the External one yields a 256-byte EDID, VCP 0x10 is readable, and `84 03 10 ...` writes
    take effect and read back (89 → 81 → 89).
-3. `PowerMode` is not available on the built-in display (`HasPowerMode=0`), so the software path is
-   `CGDisplayCapture` rather than a power switch.
+3. `PowerMode` is not available on the built-in display (`HasPowerMode=0`); the panel is darkened with DisplayServices backlight control.
 
 ---
 

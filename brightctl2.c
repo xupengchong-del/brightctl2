@@ -9,12 +9,15 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <signal.h>
 #include <CoreGraphics/CoreGraphics.h>
 
 #include "brightctl_core.h"
 
 static bctl_display g_list[BCTL_MAX_DISPLAYS];
 static int g_n;
+static volatile sig_atomic_t blank_stop;
+static void stop_blank(int sig) { (void)sig; blank_stop = 1; }
 
 static void load(void) {
     bctl_init();
@@ -81,6 +84,12 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (base + 1 < argc && !strcmp(argv[base], "blank") && !strcmp(argv[base + 1], "off")) {
+        bctl_init();
+        bool ok = bctl_builtin_blank(false);
+        fprintf(ok ? stdout : stderr, "%s\n", bctl_t(ok ? BCTL_T_BLANK_OFF : BCTL_T_BLANK_FAIL_OFF));
+        return ok ? 0 : 1;
+    }
     load();
 
     if (base >= argc || !strcmp(argv[base], "list")) { cmd_list(); return 0; }
@@ -233,6 +242,10 @@ int main(int argc, char **argv) {
             else if (!strcmp(a1, "on")) on = true;
             else { fprintf(stderr, "%s\n", bctl_t(BCTL_T_BLANK_ARG)); return 2; }
         }
+        if (on) {
+            signal(SIGINT, stop_blank);
+            signal(SIGTERM, stop_blank);
+        }
         if (!bctl_builtin_blank(on)) {
             fprintf(stderr, "%s\n", bctl_t(on ? BCTL_T_BLANK_FAIL_ON : BCTL_T_BLANK_FAIL_OFF));
             return 1;
@@ -240,7 +253,13 @@ int main(int argc, char **argv) {
         if (!on) { printf("%s\n", bctl_t(BCTL_T_BLANK_OFF)); return 0; }
         printf("%s\n", bctl_t(BCTL_T_BLANK_ON));
         fflush(stdout);
-        for (;;) sleep(1);
+        while (!blank_stop && bctl_builtin_has_restore_state()) {
+            if (bctl_external_count() == 0) break;
+            sleep(1);
+        }
+        bool restored = bctl_builtin_blank(false);
+        printf("%s\n", bctl_t(restored ? BCTL_T_BLANK_OFF : BCTL_T_BLANK_FAIL_OFF));
+        return restored ? 0 : 1;
     }
 
     fprintf(stderr, "%s: %s\n", bctl_t(BCTL_T_UNKNOWN_CMD), cmd);

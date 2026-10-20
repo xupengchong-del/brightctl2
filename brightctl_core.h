@@ -67,16 +67,20 @@ float bctl_step_percent(uint32_t display_id, float delta);
 /* 主目标屏 id（主屏可控则取主屏，否则第一台可控屏）；无则返回 0 */
 uint32_t bctl_primary_display_id(void);
 
-/* 内建屏黑屏开关：blank=true 捕获内屏（黑屏），false 释放。
- * 捕获与进程绑定，进程退出会自动恢复。
- * 没有外接显示器时拒绝黑屏，避免用户失去所有画面。 */
+/* 内建屏黑屏：镜像到外屏并将背光亮度归零；false 恢复保存的设置。
+ * 不独占/禁用显示器；没有外屏时拒绝黑屏。 */
 bool bctl_builtin_blank(bool blank);
 bool bctl_builtin_is_blank(void);
+/* 有待恢复的亮度/自动亮度/镜像快照（即使系统已点亮也不会丢掉）。 */
+bool bctl_builtin_has_restore_state(void);
+
+/* 内建屏当前是否存在于系统中（未被断开） */
+bool bctl_builtin_present(void);
 
 /* 当前在线（含休眠）的外接显示器数量，不依赖 DDC 是否可控 */
 int  bctl_external_count(void);
 
-/* 是否有显示器正处于休眠状态（休眠期间不宜改动捕获状态） */
+/* 是否有显示器正处于休眠状态 */
 bool bctl_displays_asleep(void);
 
 /* 是否为内建屏 */

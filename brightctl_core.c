@@ -13,6 +13,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <limits.h>
 #include <dlfcn.h>
 #include <IOKit/IOKitLib.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -190,7 +193,7 @@ int bctl_probe(bctl_display *out, int max) {
 
     CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
     uint32_t n = 0;
-    if (CGGetActiveDisplayList(BCTL_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess || n == 0) return -1;
+    if (CGGetOnlineDisplayList(BCTL_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess || n == 0) return -1;
     if (n > BCTL_MAX_DISPLAYS) n = BCTL_MAX_DISPLAYS;
 
     for (uint32_t i = 0; i < n; i++) {
@@ -341,177 +344,276 @@ bool bctl_is_builtin(uint32_t display_id) {
     return e && e->is_builtin;
 }
 
-/* ---------- 内屏关闭（显示配置事务） ----------
- *
- * 早期用 CGDisplayCapture 独占内屏，副作用很重：被捕获的显示器无法正常参与
- * WindowServer 合成，系统截图快捷键会静默失效，显示器也无法正常休眠/锁屏。
- *
- * 改用显示配置事务把内屏「断开」：内屏会从 online 列表消失，就像拔掉了显示器，
- * 截图、锁屏、休眠全部保持系统原生行为。
- *
- * 注意：断开后内屏不在 online 列表里，无法再从系统枚举出它的 id，
- * 因此断开时把 id 落盘，恢复时据此接回；进程退出也不会让内屏永久消失。
+/* ---------- 内屏黑屏：镜像到外屏 + 关闭背光 ----------
+ * 不独占或禁用显示器。操作前保存恢复快照，失败/拔线/正常退出时还原。
+ * 此方法关闭可见背光，不宣称将面板从硬件上断电。
  */
+typedef bool (*DSHasALC_fn)(CGDirectDisplayID);
+typedef int (*DSGetALC_fn)(CGDirectDisplayID, bool *);
+typedef int (*DSSetALC_fn)(CGDirectDisplayID, bool);
+static DSHasALC_fn g_has_alc;
+static DSGetALC_fn g_get_alc;
+static DSSetALC_fn g_set_alc;
+static const CFStringRef restore_domain = CFSTR("local.brightctl2.restore");
+static const CFStringRef restore_key = CFSTR("builtinBlank");
 
-static CGDirectDisplayID g_blank_id;
-static bool g_blanked;
+typedef struct {
+    float brightness;
+    bool has_alc;
+    bool auto_brightness;
+    uint32_t prior_mirror;
+    bool mirror_changed;
+    double x, y;
+} BlankSnapshot;
 
-typedef int (*ConfigureDisplayEnabled_fn)(CGDisplayConfigRef, CGDirectDisplayID, int);
-
-static ConfigureDisplayEnabled_fn g_configure_enabled;
-
-static bool load_configure_display_enabled(void) {
-    if (g_configure_enabled) return true;
-    void *h = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight",
-                     RTLD_LAZY);
-    if (!h) return false;
-    g_configure_enabled = (ConfigureDisplayEnabled_fn)dlsym(h, "SLSConfigureDisplayEnabled");
-    return g_configure_enabled != NULL;
+static void blank_init(void) {
+    bctl_init();
+    if (g_has_alc) return;
+    void *h = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_LAZY);
+    if (!h) return;
+    g_has_alc = (DSHasALC_fn)dlsym(h, "DisplayServicesHasAmbientLightCompensation");
+    g_get_alc = (DSGetALC_fn)dlsym(h, "DisplayServicesAmbientLightCompensationEnabled");
+    g_set_alc = (DSSetALC_fn)dlsym(h, "DisplayServicesEnableAmbientLightCompensation");
 }
 
-/* 提交一次显示配置事务；enabled=false 表示断开该显示器 */
-static bool apply_display_enabled(CGDirectDisplayID id, bool enabled) {
-    if (!load_configure_display_enabled()) return false;
-
-    CGDisplayConfigRef config = NULL;
-    if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess || !config) return false;
-
-    int r = g_configure_enabled(config, id, enabled ? 1 : 0);
-    if (r != 0) {
-        CGCancelDisplayConfiguration(config);
-        return false;
+static bool snapshot_load(BlankSnapshot *s) {
+    CFPropertyListRef v = CFPreferencesCopyAppValue(restore_key, restore_domain);
+    if (!v) return false;
+    bool ok = false;
+    if (CFGetTypeID(v) == CFDictionaryGetTypeID()) {
+        CFDictionaryRef d = (CFDictionaryRef)v;
+        CFTypeRef brightness = CFDictionaryGetValue(d, CFSTR("brightness"));
+        CFTypeRef mirror = CFDictionaryGetValue(d, CFSTR("mirror"));
+        CFTypeRef x = CFDictionaryGetValue(d, CFSTR("x"));
+        CFTypeRef y = CFDictionaryGetValue(d, CFSTR("y"));
+        if (brightness && mirror && x && y &&
+            CFGetTypeID(brightness) == CFNumberGetTypeID() &&
+            CFGetTypeID(mirror) == CFNumberGetTypeID() &&
+            CFGetTypeID(x) == CFNumberGetTypeID() && CFGetTypeID(y) == CFNumberGetTypeID()) {
+            ok = CFNumberGetValue(brightness, kCFNumberFloatType, &s->brightness) &&
+                 CFNumberGetValue(mirror, kCFNumberSInt32Type, &s->prior_mirror) &&
+                 CFNumberGetValue(x, kCFNumberDoubleType, &s->x) &&
+                 CFNumberGetValue(y, kCFNumberDoubleType, &s->y) &&
+                 isfinite(s->brightness) && s->brightness >= 0 && s->brightness <= 1 &&
+                 isfinite(s->x) && isfinite(s->y) && s->x >= INT32_MIN && s->x <= INT32_MAX &&
+                 s->y >= INT32_MIN && s->y <= INT32_MAX;
+            s->mirror_changed = CFDictionaryGetValue(d, CFSTR("mirrorChanged")) == kCFBooleanTrue;
+            s->has_alc = CFDictionaryGetValue(d, CFSTR("hasALC")) == kCFBooleanTrue;
+            s->auto_brightness = CFDictionaryGetValue(d, CFSTR("autoBrightness")) == kCFBooleanTrue;
+        }
     }
-    if (CGCompleteDisplayConfiguration(config, kCGConfigurePermanently) != kCGErrorSuccess)
-        return false;
-    return true;
+    CFRelease(v);
+    return ok;
 }
 
-/* 断开状态落盘，避免进程退出后内屏再也接不回来 */
-static void state_path(char *buf, size_t len) {
-    snprintf(buf, len, "/tmp/.brightctl-blanked-%d", (int)getuid());
+static bool snapshot_save(const BlankSnapshot *s) {
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                        &kCFTypeDictionaryValueCallBacks);
+    if (!d) return false;
+    CFNumberRef v = CFNumberCreate(NULL, kCFNumberFloatType, &s->brightness);
+    CFDictionarySetValue(d, CFSTR("brightness"), v); CFRelease(v);
+    v = CFNumberCreate(NULL, kCFNumberSInt32Type, &s->prior_mirror);
+    CFDictionarySetValue(d, CFSTR("mirror"), v); CFRelease(v);
+    v = CFNumberCreate(NULL, kCFNumberDoubleType, &s->x);
+    CFDictionarySetValue(d, CFSTR("x"), v); CFRelease(v);
+    v = CFNumberCreate(NULL, kCFNumberDoubleType, &s->y);
+    CFDictionarySetValue(d, CFSTR("y"), v); CFRelease(v);
+    CFDictionarySetValue(d, CFSTR("mirrorChanged"), s->mirror_changed ? kCFBooleanTrue : kCFBooleanFalse);
+    CFDictionarySetValue(d, CFSTR("hasALC"), s->has_alc ? kCFBooleanTrue : kCFBooleanFalse);
+    CFDictionarySetValue(d, CFSTR("autoBrightness"), s->auto_brightness ? kCFBooleanTrue : kCFBooleanFalse);
+    CFPreferencesSetAppValue(restore_key, d, restore_domain);
+    CFRelease(d);
+    return CFPreferencesAppSynchronize(restore_domain);
 }
 
-static void remember_blanked(CGDirectDisplayID id) {
-    char path[64];
-    state_path(path, sizeof path);
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "0x%x\n", id);
-    fclose(f);
+static bool snapshot_clear(void) {
+    CFPreferencesSetAppValue(restore_key, NULL, restore_domain);
+    return CFPreferencesAppSynchronize(restore_domain);
 }
 
-static void forget_blanked(void) {
-    char path[64];
-    state_path(path, sizeof path);
-    unlink(path);
-}
-
-static CGDirectDisplayID recall_blanked(void) {
-    char path[64];
-    state_path(path, sizeof path);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    unsigned int id = 0;
-    int got = fscanf(f, "%x", &id);
-    fclose(f);
-    return got == 1 ? (CGDirectDisplayID)id : 0;
-}
-
-/* 内屏当前是否仍存在于系统中 */
-static bool builtin_present(void) {
-    CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
+static int online_ids(CGDirectDisplayID *ids, int max) {
     uint32_t n = 0;
-    if (CGGetOnlineDisplayList(BCTL_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess) return false;
-    for (uint32_t i = 0; i < n; i++)
-        if (CGDisplayIsBuiltin(ids[i])) return true;
-    return false;
+    if (CGGetOnlineDisplayList((uint32_t)max, ids, &n) != kCGErrorSuccess) return -1;
+    return (int)n;
 }
 
-/* 找到内建屏 id（优先缓存，其次 online 枚举） */
-static CGDirectDisplayID find_builtin_display(void) {
-    for (int i = 0; i < g_count; i++)
-        if (g_entries[i].is_builtin) return g_entries[i].id;
-
+static CGDirectDisplayID current_builtin_id(void) {
     CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
-    uint32_t n = 0;
-    if (CGGetOnlineDisplayList(BCTL_MAX_DISPLAYS, ids, &n) == kCGErrorSuccess) {
-        for (uint32_t i = 0; i < n; i++)
-            if (CGDisplayIsBuiltin(ids[i])) return ids[i];
-    }
+    int n = online_ids(ids, BCTL_MAX_DISPLAYS);
+    for (int i = 0; i < n; i++) if (CGDisplayIsBuiltin(ids[i])) return ids[i];
     return 0;
 }
 
+bool bctl_builtin_present(void) { return current_builtin_id() != 0; }
+bool bctl_builtin_has_restore_state(void) {
+    BlankSnapshot s;
+    return snapshot_load(&s);
+}
+
 int bctl_external_count(void) {
-    /* 仅供自动化测试模拟「没有外接显示器」的场景 */
     if (getenv("BRIGHTCTL_TEST_NO_EXTERNAL")) return 0;
-    /* 用 online 而不是 active：显示器休眠时会从 active 列表消失，
-     * 但它仍然连着、画面也还在，不能当成「外屏没了」。 */
     CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
-    uint32_t n = 0;
-    if (CGGetOnlineDisplayList(BCTL_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess) return 0;
+    int n = online_ids(ids, BCTL_MAX_DISPLAYS);
+    if (n < 0) return -1; // 查询失败不能伪装成拔线
     int ext = 0;
-    for (uint32_t i = 0; i < n; i++)
-        if (!CGDisplayIsBuiltin(ids[i])) ext++;
+    for (int i = 0; i < n; i++) if (!CGDisplayIsBuiltin(ids[i])) ext++;
     return ext;
 }
 
 bool bctl_displays_asleep(void) {
     CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
-    uint32_t n = 0;
-    if (CGGetOnlineDisplayList(BCTL_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess) return false;
-    for (uint32_t i = 0; i < n; i++)
-        if (CGDisplayIsAsleep(ids[i])) return true;
+    int n = online_ids(ids, BCTL_MAX_DISPLAYS);
+    if (n < 0) return true;
+    for (int i = 0; i < n; i++) if (CGDisplayIsAsleep(ids[i])) return true;
     return false;
 }
 
-bool bctl_builtin_blank(bool blank) {
-    if (blank) {
-        if (bctl_builtin_is_blank()) return true;
-        /* 安全阀：没有外接显示器时绝不能关掉内屏，否则用户没有任何画面 */
-        if (bctl_external_count() == 0) return false;
-        CGDirectDisplayID target = find_builtin_display();
-        if (!target) return false;
-        if (!apply_display_enabled(target, false)) return false;
-        g_blank_id = target;
-        g_blanked = true;
-        remember_blanked(target);
-        return true;
-    }
+static bool display_online(CGDirectDisplayID id) {
+    CGDirectDisplayID ids[BCTL_MAX_DISPLAYS];
+    int n = online_ids(ids, BCTL_MAX_DISPLAYS);
+    for (int i = 0; i < n; i++) if (ids[i] == id) return true;
+    return false;
+}
 
-    /* 恢复：即使本进程没记录过状态，只要磁盘上有记录就接回来 */
-    CGDirectDisplayID target = g_blanked ? g_blank_id : recall_blanked();
-    if (!target) {
-        if (builtin_present()) { forget_blanked(); g_blanked = false; g_blank_id = 0; return true; }
+static bool set_builtin_mirror(CGDirectDisplayID id, CGDirectDisplayID target, const BlankSnapshot *restore) {
+    if (CGDisplayMirrorsDisplay(id) == target && !restore) return true;
+    CGDisplayConfigRef config = NULL;
+    if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) return false;
+    CGError err = CGConfigureDisplayMirrorOfDisplay(config, id, target);
+    if (err == kCGErrorSuccess && restore && !target)
+        err = CGConfigureDisplayOrigin(config, id, (int32_t)restore->x, (int32_t)restore->y);
+    if (err != kCGErrorSuccess) { CGCancelDisplayConfiguration(config); return false; }
+    return CGCompleteDisplayConfiguration(config, kCGConfigureForSession) == kCGErrorSuccess;
+}
+
+static bool wait_for_blank_state(CGDirectDisplayID id, bool dark) {
+    for (int attempt = 0; attempt < 24; attempt++) {
+        float value = -1;
+        if (ds_read(id, &value) && (dark ? value <= 0.01f : value >= 0.05f)) return true;
+        usleep(25000);
+    }
+    return false;
+}
+
+static bool wait_for_restored_brightness(CGDirectDisplayID id, float target) {
+    int stable = 0;
+    for (int attempt = 0; attempt < 24; attempt++) {
+        float value = -1;
+        if (ds_read(id, &value) && fabsf(value - target) <= 0.03f) {
+            if (++stable >= 2) return true;
+        } else stable = 0;
+        usleep(25000);
+    }
+    return false;
+}
+
+static bool wait_for_mirror(CGDirectDisplayID id, CGDirectDisplayID target) {
+    for (int attempt = 0; attempt < 24; attempt++) {
+        if (CGDisplayMirrorsDisplay(id) == target) return true;
+        usleep(25000);
+    }
+    return false;
+}
+
+static bool restore_builtin(CGDirectDisplayID id, const BlankSnapshot *s) {
+    // 先点亮，再撤镜像；任何一步失败都保留快照供重试。
+    /* 原来开着自动亮度时，恢复到「确实可用」的亮度，否则 ALC 接管后可能停在近乎全黑。 */
+    float target = fmaxf(s->brightness, s->auto_brightness ? 0.3f : 0.1f);
+    bool bright_ok = ds_write(id, target);
+    uint32_t mirror = s->prior_mirror;
+    if (mirror && !display_online(mirror)) mirror = 0;
+    CGRect current_bounds = CGDisplayBounds(id);
+    bool origin_ok = mirror || (current_bounds.origin.x == s->x && current_bounds.origin.y == s->y);
+    bool mirror_ok = !s->mirror_changed ||
+        ((CGDisplayMirrorsDisplay(id) == mirror && origin_ok) || set_builtin_mirror(id, mirror, s));
+    if (s->mirror_changed) mirror_ok = wait_for_mirror(id, mirror) && mirror_ok;
+    // 镜像重配置可能重置亮度，待配置完成再确认。读回失败不能当成功。
+    bright_ok = ds_write(id, target) && bright_ok;
+    if (s->auto_brightness) {
+        /* 原本开启自动亮度：传感器会立刻接管，无法稳定等于快照值，
+         * 但必须确认已经亮到可用水平，避免在近乎全黑的状态下丢弃快照。 */
+        bright_ok = wait_for_blank_state(id, false) && bright_ok;
+        float value = -1;
+        bright_ok = ds_read(id, &value) && value >= 0.2f && bright_ok;
+    } else {
+        bright_ok = wait_for_restored_brightness(id, target) && bright_ok;
+    }
+    bool alc_ok = !s->has_alc || (g_set_alc && g_set_alc(id, s->auto_brightness) == 0);
+    if (!bright_ok || !mirror_ok || !alc_ok) return false;
+    /* 只有确认内屏可见、镜像已还原后才丢弃快照，避免恢复失败后无法重试。 */
+    return snapshot_clear();
+}
+
+static bool builtin_blank_locked(bool blank) {
+    blank_init();
+    CGDirectDisplayID id = current_builtin_id();
+    BlankSnapshot s;
+    bool pending = snapshot_load(&s);
+    if (!blank) {
+        if (!pending) return true; // 没改过的不碰；不再猜显示器 ID
+        if (!id) return false;     // 合盖/查询失败时保留恢复记录
+        return restore_builtin(id, &s);
+    }
+    if (!id || bctl_external_count() <= 0 || CGDisplayIsAsleep(id)) return false;
+    CGDirectDisplayID ids[BCTL_MAX_DISPLAYS], target = 0;
+    int n = online_ids(ids, BCTL_MAX_DISPLAYS);
+    for (int i = 0; i < n; i++) {
+        if (!CGDisplayIsBuiltin(ids[i]) && !CGDisplayIsAsleep(ids[i]) &&
+            (target == 0 || ids[i] == CGMainDisplayID())) target = ids[i];
+    }
+    if (!target) return false;
+    if (!pending) {
+        if (!ds_read(id, &s.brightness)) return false;
+        s.prior_mirror = CGDisplayMirrorsDisplay(id);
+        // 若已有镜像组（包括内屏是源屏），仅关背光，不改用户的镜像图。
+        s.mirror_changed = !CGDisplayIsInMirrorSet(id);
+        CGRect bounds = CGDisplayBounds(id);
+        s.x = bounds.origin.x; s.y = bounds.origin.y;
+        s.has_alc = g_has_alc && g_has_alc(id);
+        s.auto_brightness = false;
+        if (s.has_alc && (!g_get_alc || !g_set_alc || g_get_alc(id, &s.auto_brightness) != 0)) return false;
+        if (!snapshot_save(&s)) return false; // 首次保存必须发生在硬件修改前
+    }
+    if ((s.mirror_changed && (!set_builtin_mirror(id, target, NULL) || !wait_for_mirror(id, target))) ||
+        bctl_external_count() <= 0 ||
+        (s.has_alc && (!g_set_alc || g_set_alc(id, false) != 0)) || !ds_write(id, 0)) {
+        (void)restore_builtin(id, &s);
         return false;
     }
-    if (builtin_present()) {
-        forget_blanked();
-        g_blanked = false;
-        g_blank_id = 0;
-        return true;
+    if (!wait_for_blank_state(id, true) || bctl_external_count() <= 0 ||
+        (s.mirror_changed && CGDisplayMirrorsDisplay(id) != target)) {
+        (void)restore_builtin(id, &s);
+        return false;
     }
-    bool ok = apply_display_enabled(target, true);
-    if (ok) {
-        forget_blanked();
-        g_blanked = false;
-        g_blank_id = 0;
+    return true;
+}
+
+bool bctl_builtin_blank(bool blank) {
+    // CLI 与 app 共用恢复快照，整个读/保存/改动/恢复事务跨进程串行化。
+    char path[96];
+    snprintf(path, sizeof path, "/tmp/.brightctl-blank-%u.lock", (unsigned)getuid());
+    int fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) {
+        close(fd); return false;
     }
+    int rc;
+    do { rc = flock(fd, LOCK_EX); } while (rc < 0 && errno == EINTR);
+    if (rc != 0) { close(fd); return false; }
+    // 另一进程可能已更新/清理快照，先刷新共享偏好缓存。
+    bool ok = CFPreferencesAppSynchronize(restore_domain) && builtin_blank_locked(blank);
+    flock(fd, LOCK_UN);
+    close(fd);
     return ok;
 }
 
 bool bctl_builtin_is_blank(void) {
-    /* 以系统真实状态 + 落盘记录为准：
-     * 内屏不在 online 列表里，且有记录，才算「已关闭」。 */
-    if (builtin_present()) {
-        if (g_blanked) { g_blanked = false; g_blank_id = 0; }
-        forget_blanked();
-        return false;
-    }
-    CGDirectDisplayID id = g_blanked ? g_blank_id : recall_blanked();
-    if (!id) return false;
-    g_blank_id = id;
-    g_blanked = true;
-    return true;
+    blank_init();
+    if (!bctl_builtin_has_restore_state()) return false;
+    CGDirectDisplayID id = current_builtin_id();
+    float v = -1;
+    return id && ds_read(id, &v) && v <= 0.01f && CGDisplayIsInMirrorSet(id);
 }
 
 /* ---------- 本地化 ---------- */
