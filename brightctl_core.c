@@ -507,9 +507,17 @@ static bool wait_for_restored_brightness(CGDirectDisplayID id, float target) {
     return false;
 }
 
+/* 镜像状态判定：target=0 表示「必须离开镜像组」。
+ * 注意 CGDisplayMirrorsDisplay 对「未镜像」和「镜像组主屏」都返回 0，
+ * 只看它会误判成功，必须结合 CGDisplayIsInMirrorSet。 */
+static bool mirror_state_reached(CGDirectDisplayID id, CGDirectDisplayID target) {
+    if (target == 0) return CGDisplayIsInMirrorSet(id) == 0;
+    return CGDisplayMirrorsDisplay(id) == target;
+}
+
 static bool wait_for_mirror(CGDirectDisplayID id, CGDirectDisplayID target) {
     for (int attempt = 0; attempt < 24; attempt++) {
-        if (CGDisplayMirrorsDisplay(id) == target) return true;
+        if (mirror_state_reached(id, target)) return true;
         usleep(25000);
     }
     return false;
@@ -524,9 +532,14 @@ static bool restore_builtin(CGDirectDisplayID id, const BlankSnapshot *s) {
     if (mirror && !display_online(mirror)) mirror = 0;
     CGRect current_bounds = CGDisplayBounds(id);
     bool origin_ok = mirror || (current_bounds.origin.x == s->x && current_bounds.origin.y == s->y);
-    bool mirror_ok = !s->mirror_changed ||
-        ((CGDisplayMirrorsDisplay(id) == mirror && origin_ok) || set_builtin_mirror(id, mirror, s));
-    if (s->mirror_changed) mirror_ok = wait_for_mirror(id, mirror) && mirror_ok;
+    bool mirror_ok = true;
+    if (s->mirror_changed) {
+        /* 已达成目标（含「已离开镜像组」）就不要再触发一次重配置。 */
+        if (!mirror_state_reached(id, mirror) || !origin_ok) {
+            mirror_ok = set_builtin_mirror(id, mirror, s);
+        }
+        mirror_ok = wait_for_mirror(id, mirror) && mirror_ok;
+    }
     // 镜像重配置可能重置亮度，待配置完成再确认。读回失败不能当成功。
     bright_ok = ds_write(id, target) && bright_ok;
     if (s->auto_brightness) {
