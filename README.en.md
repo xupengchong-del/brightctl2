@@ -2,18 +2,46 @@
 
 [中文](README.md) | **English**
 
-A macOS brightness control tool with both a command-line interface and a menu bar app.
+Control both the built-in and external display brightness on macOS: a menu bar app for daily use,
+a CLI for scripting. The built-in panel turns off automatically when an external display is
+connected, and comes back when you unplug it.
 
-On Apple Silicon Macs (tested on MacBook Pro M3 Pro with an LG UltraFine as the main display),
-the classic third-party brightness APIs (`IODisplay*`, `CGDisplayIOServicePort`, `CoreDisplay*`)
-no longer work. This tool uses two system channels that **do work in practice**:
+## Install
 
-| Channel | Target | Underlying API | Implementation |
-|---|---|---|---|
-| CH1 `DisplayServices` | Built-in / Apple displays | private `DisplayServices.framework` | `dlopen` + `DisplayServicesGet/SetBrightness` |
-| CH2 `DDC/CI over IOAVService` | External displays (HDMI / DP / USB-C / Thunderbolt) | IOKit `IOAVService` + I2C | `DCPAVServiceProxy` → `IOAVServiceWrite/ReadI2C`, VCP 0x10 |
+Download `BrightCtl-1.0.0-macos-arm64.zip` from the
+[latest release](https://github.com/xupengchong-del/brightctl2/releases/latest), unzip it, and drag
+`BrightCtl.app` into /Applications.
 
-Neither channel needs root or special entitlements — a normally `clang`-compiled binary is enough.
+**Right-click → Open** the first time (the app is not notarized by Apple). If macOS says the app is
+damaged:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/BrightCtl.app
+```
+
+Requires macOS 13+ on Apple Silicon. A ☀️ icon appears in the menu bar.
+
+Or build from source:
+
+```bash
+make          # build the CLI
+make app      # build the menu bar app
+make install  # install into /Applications
+make test     # regression tests that really change brightness
+```
+
+## Why not the usual approach
+
+macOS has no public API to truly turn off a single display. The common trick is `CGDisplayCapture`,
+but a captured display drops out of normal WindowServer compositing — while it is captured, **the
+system screenshot shortcut silently stops working**, and sleep/lock misbehave.
+
+This tool instead **mirrors** the built-in panel to the external display and sets its backlight to 0
+via DisplayServices. The built-in stays in the system display list, so screenshots, lock and sleep
+keep working. Original brightness, auto-brightness and mirror state are saved before the change;
+failures roll back, and unplugging or quitting restores everything.
+
+## Two brightness channels
 
 ---
 

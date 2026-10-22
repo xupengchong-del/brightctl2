@@ -2,7 +2,42 @@
 
 **中文** | [English](README.en.md)
 
-macOS 亮度控制工具，提供命令行与菜单栏应用两种形态。
+在 macOS 上统一调节内建屏和外接屏亮度：菜单栏应用负责日常使用，命令行负责脚本化。
+接上外接屏时自动关闭内建屏，拔掉后自动恢复。
+
+## 安装
+
+下载 [最新 Release](https://github.com/xupengchong-del/brightctl2/releases/latest) 里的
+`BrightCtl-1.0.0-macos-arm64.zip`，解压后把 `BrightCtl.app` 拖进「应用程序」。
+
+首次打开请**右键 →「打开」**（应用未经 Apple 公证）。如果提示「已损坏」：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/BrightCtl.app
+```
+
+要求 macOS 13+、Apple Silicon。菜单栏会出现 ☀️ 图标，点开即可调节亮度。
+
+也可以从源码构建：
+
+```bash
+make          # 编译 CLI
+make app      # 编译菜单栏应用
+make install  # 安装到 /Applications
+make test     # 真实读写亮度的回归测试
+```
+
+## 为什么不用现成方案
+
+macOS 上没有公开 API 能真正「关闭」单块屏幕。常见做法是 `CGDisplayCapture` 独占屏幕，
+但它会让被独占的屏幕退出 WindowServer 合成流程，副作用是被捕获期间**系统截图快捷键静默失效、
+锁屏和休眠异常**。
+
+本工具改用另一条路：把内屏**镜像**到外屏，再用 DisplayServices 把背光设为 0。
+内屏始终留在系统显示器列表里，截图、锁屏、休眠全部保持原生行为。
+操作前会保存原亮度、自动亮度和镜像状态，失败立即回滚，拔线或退出时恢复。
+
+## 两条亮度通道
 
 在 Apple Silicon 机器上（实测环境：MacBook Pro M3 Pro + 外接 LG UltraFine 作主屏），
 传统第三方亮度 API（IODisplay、CGDisplayIOServicePort、CoreDisplay）基本失效。
@@ -11,7 +46,7 @@ macOS 亮度控制工具，提供命令行与菜单栏应用两种形态。
 | 通道 | 目标屏 | 底层 | 实现 |
 |---|---|---|---|
 | CH1 `DisplayServices` | 内建 / Apple 硬件屏 | 私有框架 `DisplayServices.framework` | `dlopen` + `DisplayServicesGet/SetBrightness` |
-| CH2 `DDC/CI over IOAVService` | 外接屏（HDMI/DP/USB-C/雷雳） | IOKit `IOAVService` + I2C | `DCPAVServiceProxy` → `IOAVServiceWrite/ReadI2C` 收发 VCP 0x10 |
+| CH2 `DDC/CI over IOAVService` | 外接屏（HDMI/DP/USB-C/雷 Thunderbolt） | IOKit `IOAVService` + I2C | `DCPAVServiceProxy` → `IOAVServiceWrite/ReadI2C` 收发 VCP 0x10 |
 
 两条通道都**不需要** root、不需要特殊 entitlement，普通 `clang` 编译的程序即可调用。
 
