@@ -58,10 +58,26 @@ static void cmd_list(void) {
     }
 }
 
+static void fmt_bytes_rate(double bps, char *buf, size_t len) {
+    if (bps < 0) { snprintf(buf, len, "-"); return; }
+    if (bps < 1024)                snprintf(buf, len, "%.0f B/s", bps);
+    else if (bps < 1024 * 1024)    snprintf(buf, len, "%.1f KB/s", bps / 1024);
+    else                           snprintf(buf, len, "%.1f MB/s", bps / 1048576);
+}
+
+static void fmt_uptime(double sec, char *buf, size_t len) {
+    if (sec < 0) { snprintf(buf, len, "-"); return; }
+    long s = (long)sec;
+    long d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60;
+    if (d > 0)      snprintf(buf, len, "%ldd %ldh", d, h);
+    else if (h > 0) snprintf(buf, len, "%ldh %ldm", h, m);
+    else            snprintf(buf, len, "%ldm", m);
+}
+
 static void cmd_sys(void) {
     bctl_sysmon_init();
     bctl_sysinfo a, b;
-    /* 两次采样之间留出间隔，CPU 占用率才有意义 */
+    /* 两次采样之间留出间隔，CPU 占用率与网络速率才有意义 */
     bctl_sysmon_sample(&a);
     usleep(400000);
     bctl_sysmon_sample(&b);
@@ -73,6 +89,9 @@ static void cmd_sys(void) {
                b.core_count, b.cpu_count);
     else
         printf("  %-6s %s\n", bctl_t(BCTL_T_SYS_CPU), bctl_t(BCTL_T_SYS_UNAVAILABLE));
+
+    if (b.gpu_percent >= 0)
+        printf("  %-6s %5.1f%%\n", bctl_t(BCTL_T_SYS_GPU), b.gpu_percent);
 
     if (b.mem_percent >= 0)
         printf("  %-6s %5.1f%%   (%.0f/%.0f MB)\n", bctl_t(BCTL_T_SYS_MEM), b.mem_percent,
@@ -86,9 +105,32 @@ static void cmd_sys(void) {
     else
         printf("  %-6s %s\n", bctl_t(BCTL_T_SYS_TEMP), bctl_t(BCTL_T_SYS_UNAVAILABLE));
 
+    if (b.disk_percent >= 0)
+        printf("  %-6s %5.1f%%   (%.0f/%.0f GB)\n", bctl_t(BCTL_T_SYS_DISK), b.disk_percent,
+               b.disk_used_gb, b.disk_total_gb);
+
+    if (b.has_battery && b.battery_percent >= 0) {
+        const char *state = b.battery_charging ? bctl_t(BCTL_T_SYS_CHARGING)
+                          : b.battery_on_ac   ? bctl_t(BCTL_T_SYS_ON_AC) : "";
+        printf("  %-6s %5.1f%%   %s\n", bctl_t(BCTL_T_SYS_BATTERY), b.battery_percent, state);
+    }
+
+    if (b.net_available && (b.net_rx_bps >= 0 || b.net_tx_bps >= 0)) {
+        char rx[32], tx[32];
+        fmt_bytes_rate(b.net_rx_bps, rx, sizeof rx);
+        fmt_bytes_rate(b.net_tx_bps, tx, sizeof tx);
+        printf("  %-6s ↓%s  ↑%s\n", bctl_t(BCTL_T_SYS_NET), rx, tx);
+    }
+
     if (b.load1 >= 0)
         printf("  %-6s %.2f  %.2f  %.2f\n", bctl_t(BCTL_T_SYS_LOAD),
                b.load1, b.load5, b.load15);
+
+    {
+        char up[32];
+        fmt_uptime(b.uptime_seconds, up, sizeof up);
+        printf("  %-6s %s\n", bctl_t(BCTL_T_SYS_UPTIME), up);
+    }
 
     if (b.process_count > 0)
         printf("  %-6s %d\n", bctl_t(BCTL_T_SYS_PROC), b.process_count);

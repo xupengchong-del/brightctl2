@@ -21,6 +21,11 @@
 #include <mach/processor_info.h>
 #include <mach/mach_host.h>
 #include <sys/sysctl.h>
+#include <sys/mount.h>
+#include <sys/time.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <net/if_var.h>
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
 
@@ -225,12 +230,174 @@ static int process_count(void) {
     return (int)(size / sizeof kp);
 }
 
+
+/* ---------- GPU 占用（直接查 IOAccelerator，避免 ioreg 全量遍历） ---------- */
+
+static double gpu_utilization(void) {
+    io_iterator_t iter = 0;
+    CFMutableDictionaryRef match = IOServiceMatching("IOAccelerator");
+    if (!match) return -1;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &iter) != KERN_SUCCESS) return -1;
+
+    double best = -1;
+    io_service_t svc;
+    while ((svc = IOIteratorNext(iter))) {
+        CFTypeRef stats = IORegistryEntryCreateCFProperty(svc, CFSTR("PerformanceStatistics"),
+                                                          kCFAllocatorDefault, 0);
+        if (stats && CFGetTypeID(stats) == CFDictionaryGetTypeID()) {
+            CFTypeRef v = CFDictionaryGetValue((CFDictionaryRef)stats, CFSTR("Device Utilization %"));
+            if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
+                int pct = 0;
+                if (CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &pct) && pct > best)
+                    best = (double)pct;
+            }
+            v = CFDictionaryGetValue((CFDictionaryRef)stats, CFSTR("Renderer Utilization %"));
+            if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
+                int pct = 0;
+                if (CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &pct) && pct > best)
+                    best = (double)pct;
+            }
+        }
+        if (stats) CFRelease(stats);
+        IOObjectRelease(svc);
+    }
+    IOObjectRelease(iter);
+    return best;
+}
+
+/* ---------- 电池 ---------- */
+
+static void read_battery(bool *has, double *percent, bool *charging, bool *on_ac) {
+    *has = false; *percent = -1; *charging = false; *on_ac = false;
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"));
+    if (!svc) return;
+
+    int cur = 0, max = 0;
+    bool chg = false, ac = false;
+    CFTypeRef v;
+    if ((v = IORegistryEntryCreateCFProperty(svc, CFSTR("CurrentCapacity"), kCFAllocatorDefault, 0))) {
+        if (CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &cur);
+        CFRelease(v);
+    }
+    if ((v = IORegistryEntryCreateCFProperty(svc, CFSTR("MaxCapacity"), kCFAllocatorDefault, 0))) {
+        if (CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &max);
+        CFRelease(v);
+    }
+    if ((v = IORegistryEntryCreateCFProperty(svc, CFSTR("IsCharging"), kCFAllocatorDefault, 0))) {
+        chg = (v == kCFBooleanTrue);
+        CFRelease(v);
+    }
+    if ((v = IORegistryEntryCreateCFProperty(svc, CFSTR("ExternalConnected"), kCFAllocatorDefault, 0))) {
+        ac = (v == kCFBooleanTrue);
+        CFRelease(v);
+    }
+    IOObjectRelease(svc);
+
+    *has = true;
+    *charging = chg;
+    *on_ac = ac;
+    if (max > 0) *percent = 100.0 * (double)cur / (double)max;
+}
+
+/* ---------- 磁盘（根卷） ---------- */
+
+static void read_disk(double *used_gb, double *total_gb, double *percent) {
+    struct statfs sf;
+    if (statfs("/System/Volumes/Data", &sf) != 0 && statfs("/", &sf) != 0) {
+        *used_gb = *total_gb = *percent = -1;
+        return;
+    }
+    double bsize = (double)sf.f_bsize;
+    double total = (double)sf.f_blocks * bsize;
+    double avail = (double)sf.f_bavail * bsize;
+    *total_gb = total / 1073741824.0;
+    *used_gb = (total - avail) / 1073741824.0;
+    *percent = total > 0 ? (total - avail) / total * 100.0 : -1;
+}
+
+/* ---------- 网络（默认路由接口，累计字节求差） ---------- */
+
+static uint64_t g_prev_rx, g_prev_tx;
+static bool g_have_net_baseline;
+
+static void read_network(double *rx_bps, double *tx_bps, double elapsed_sec, bool *ok) {
+    *rx_bps = *tx_bps = -1;
+    *ok = false;
+
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return;
+
+    uint64_t rx = 0, tx = 0;
+    bool found = false;
+    for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_LINK || !p->ifa_data) continue;
+        /* 跳过回环与非常用接口 */
+        if (strncmp(p->ifa_name, "lo", 2) == 0) continue;
+        if (strncmp(p->ifa_name, "en", 2) != 0 && strncmp(p->ifa_name, "utun", 4) != 0) continue;
+        struct if_data *d = (struct if_data *)p->ifa_data;
+        rx += (uint64_t)d->ifi_ibytes;
+        tx += (uint64_t)d->ifi_obytes;
+        found = true;
+    }
+    freeifaddrs(ifa);
+    if (!found) return;
+    *ok = true;
+
+    if (!g_have_net_baseline || elapsed_sec <= 0) {
+        g_prev_rx = rx; g_prev_tx = tx;
+        g_have_net_baseline = true;
+        return;   /* 首次没有速率 */
+    }
+    /* 计数回绕或接口重连时可能变小，按 0 处理而不是显示负数 */
+    double drx = rx >= g_prev_rx ? (double)(rx - g_prev_rx) : 0;
+    double dtx = tx >= g_prev_tx ? (double)(tx - g_prev_tx) : 0;
+    g_prev_rx = rx; g_prev_tx = tx;
+
+    *rx_bps = drx / elapsed_sec;
+    *tx_bps = dtx / elapsed_sec;
+}
+
+/* ---------- 开机时长 ---------- */
+
+static double uptime_seconds(void) {
+    struct timeval boot;
+    size_t len = sizeof boot;
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    if (sysctl(mib, 2, &boot, &len, NULL, 0) != 0) return -1;
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    return (double)(now.tv_sec - boot.tv_sec);
+}
+
 /* ---------- 汇总 ---------- */
+
+/* 分级缓存：便宜指标每次采，昂贵指标按各自周期降频刷新。
+ * 面板每 2 秒刷新一次，温度/GPU 每 4 秒、电池每 8 秒、磁盘每 10 秒，
+ * 避免为「显示一行字」反复唤起床、跑 IORegistry 查询。 */
+static struct timespec g_last_temp, g_last_gpu, g_last_batt, g_last_disk;
+static bool g_have_cache;
+static double g_c_cpu_temp = -1, g_c_gpu_temp = -1, g_c_gpu_pct = -1;
+static bool   g_c_temp_ok;
+static bool   g_c_has_batt; static double g_c_batt_pct = -1;
+static bool   g_c_batt_chg, g_c_batt_ac;
+static double g_c_disk_used = -1, g_c_disk_total = -1, g_c_disk_pct = -1;
+
+static double elapsed_since(struct timespec *t) {
+    if (__builtin_expect(!g_have_cache, 1)) return 1e9;   /* 首次立即刷新 */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)(now.tv_sec - t->tv_sec) + (double)(now.tv_nsec - t->tv_nsec) / 1e9;
+}
+
+static void mark_now(struct timespec *t) { clock_gettime(CLOCK_MONOTONIC, t); }
 
 void bctl_sysmon_sample(bctl_sysinfo *out) {
     if (!out) return;
     bctl_sysmon_init();
     memset(out, 0, sizeof *out);
+
+    struct timespec t_begin;
+    clock_gettime(CLOCK_MONOTONIC, &t_begin);
 
     out->cpu_percent = cpu_percent_now();
 
@@ -244,13 +411,57 @@ void bctl_sysmon_sample(bctl_sysinfo *out) {
 
     read_memory(&out->mem_total_mb, &out->mem_used_mb, &out->mem_percent);
 
-    double cpu = -1, gpu = -1;
-    out->temp_available = bctl_sysmon_temp(&cpu, &gpu);
-    out->cpu_temp = cpu;
-    out->gpu_temp = gpu;
+    /* 温度：每 4 秒 */
+    if (elapsed_since(&g_last_temp) >= 4.0) {
+        double c = -1, g = -1;
+        g_c_temp_ok = bctl_sysmon_temp(&c, &g);
+        g_c_cpu_temp = c; g_c_gpu_temp = g;
+        mark_now(&g_last_temp);
+    }
+    out->temp_available = g_c_temp_ok;
+    out->cpu_temp = g_c_cpu_temp;
+    out->gpu_temp = g_c_gpu_temp;
 
+    /* GPU：每 4 秒 */
+    if (elapsed_since(&g_last_gpu) >= 4.0) {
+        g_c_gpu_pct = gpu_utilization();
+        mark_now(&g_last_gpu);
+    }
+    out->gpu_percent = g_c_gpu_pct;
+
+    /* 电池：每 8 秒 */
+    if (elapsed_since(&g_last_batt) >= 8.0) {
+        read_battery(&g_c_has_batt, &g_c_batt_pct, &g_c_batt_chg, &g_c_batt_ac);
+        mark_now(&g_last_batt);
+    }
+    out->has_battery = g_c_has_batt;
+    out->battery_percent = g_c_batt_pct;
+    out->battery_charging = g_c_batt_chg;
+    out->battery_on_ac = g_c_batt_ac;
+
+    /* 磁盘：每 10 秒 */
+    if (elapsed_since(&g_last_disk) >= 10.0) {
+        read_disk(&g_c_disk_used, &g_c_disk_total, &g_c_disk_pct);
+        mark_now(&g_last_disk);
+    }
+    out->disk_used_gb = g_c_disk_used;
+    out->disk_total_gb = g_c_disk_total;
+    out->disk_percent = g_c_disk_pct;
+
+    /* 网络：取决于与上次采样的真实间隔 */
+    static struct timespec t_prev_sample;
+    double interval = g_have_cache
+        ? (double)(t_begin.tv_sec - t_prev_sample.tv_sec) +
+          (double)(t_begin.tv_nsec - t_prev_sample.tv_nsec) / 1e9
+        : 0;
+    t_prev_sample = t_begin;
+    read_network(&out->net_rx_bps, &out->net_tx_bps, interval, &out->net_available);
+
+    out->uptime_seconds = uptime_seconds();
     read_load(&out->load1, &out->load5, &out->load15);
     out->process_count = process_count();
+
+    g_have_cache = true;
 }
 
 double bctl_sysmon_cpu_percent(void) {

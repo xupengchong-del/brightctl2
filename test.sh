@@ -99,6 +99,10 @@ printf '%s\n' "$SYS_ZH" | grep -q '系统状态' && ok "sys 标题" || bad "sys 
 printf '%s\n' "$SYS_ZH" | grep -Eq 'CPU +[0-9]+\.[0-9]%' && ok "sys CPU 数值" || bad "sys CPU 异常"
 printf '%s\n' "$SYS_ZH" | grep -Eq '内存 +[0-9]+\.[0-9]%' && ok "sys 内存数值" || bad "sys 内存异常"
 printf '%s\n' "$SYS_ZH" | grep -Eq '负载 [0-9]' && ok "sys 负载数值" || bad "sys 负载异常"
+printf '%s\n' "$SYS_ZH" | grep -Eq 'GPU +[0-9]+' && ok "sys GPU 数值" || bad "sys GPU 异常"
+printf '%s\n' "$SYS_ZH" | grep -Eq '磁盘 +[0-9]+\.[0-9]%' && ok "sys 磁盘数值" || bad "sys 磁盘异常"
+printf '%s\n' "$SYS_ZH" | grep -Eq '已运行' && ok "sys 开机时长" || bad "sys 开机时长异常"
+printf '%s\n' "$SYS_ZH" | grep -Eq '网络 ↓' && ok "sys 网络速率" || bad "sys 网络异常"
 SYS_EN="$($BIN --lang en sys 2>&1)"
 printf '%s\n' "$SYS_EN" | grep -q 'System' && ok "sys 英文标题" || bad "sys 英文标题异常: $SYS_EN"
 

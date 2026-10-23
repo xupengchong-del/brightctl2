@@ -717,6 +717,13 @@ static const bctl_msg g_msgs[BCTL_T_COUNT] = {
     [BCTL_T_SYS_UNAVAILABLE] = {"不可用", "unavailable"},
     [BCTL_T_USAGE_SYS]       = {"  brightctl2 sys            显示 CPU/内存/温度/负载\n",
                                 "  brightctl2 sys            show CPU/memory/temperature/load\n"},
+    [BCTL_T_SYS_GPU]         = {"GPU", "GPU"},
+    [BCTL_T_SYS_BATTERY]     = {"电池", "Battery"},
+    [BCTL_T_SYS_DISK]        = {"磁盘", "Disk"},
+    [BCTL_T_SYS_NET]         = {"网络", "Net"},
+    [BCTL_T_SYS_UPTIME]      = {"已运行", "Uptime"},
+    [BCTL_T_SYS_CHARGING]    = {"充电中", "charging"},
+    [BCTL_T_SYS_ON_AC]       = {"外接电源", "on AC"},
 };
 
 static char g_lang_setting[8] = "auto";

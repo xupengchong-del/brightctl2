@@ -105,10 +105,10 @@ final class DisplayRow: NSView {
         }
         title += String(format: "  0x%x", display.display_id)
         nameLabel.stringValue = title
-        nameLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        nameLabel.font = .systemFont(ofSize: 13, weight: .medium)
         nameLabel.textColor = .labelColor
 
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         valueLabel.alignment = .right
         valueLabel.textColor = .secondaryLabelColor
 
@@ -217,10 +217,10 @@ final class PanelViewController: NSViewController {
     }
 
     override func loadView() {
-        let v = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 220))
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 240))
         view = v
 
-        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
         titleLabel.textColor = .labelColor
 
         stack.orientation = .vertical
@@ -228,17 +228,17 @@ final class PanelViewController: NSViewController {
         stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        hintLabel.font = .systemFont(ofSize: 10)
+        hintLabel.font = .systemFont(ofSize: 11)
         hintLabel.textColor = .tertiaryLabelColor
 
-        sysLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        sysLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
         sysLabel.textColor = .secondaryLabelColor
-        sysLabel.maximumNumberOfLines = 2
+        sysLabel.maximumNumberOfLines = 8
         sysLabel.lineBreakMode = .byWordWrapping
 
         langPopup.target = self
         langPopup.action = #selector(languageChanged(_:))
-        langPopup.font = .systemFont(ofSize: 11)
+        langPopup.font = .systemFont(ofSize: 12)
         langPopup.controlSize = .small
 
         blankCheck.target = self
@@ -256,7 +256,7 @@ final class PanelViewController: NSViewController {
         quit.action = #selector(quitApp)
         quit.bezelStyle = .inline
         quit.isBordered = false
-        quit.font = .systemFont(ofSize: 11)
+        quit.font = .systemFont(ofSize: 12)
         quit.contentTintColor = .secondaryLabelColor
 
         v.addSubview(titleLabel)
@@ -311,8 +311,10 @@ final class PanelViewController: NSViewController {
         ])
 
         rebuild()
+        // 面板刷新同样只在可见时进行，避免后台空转
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
-            self?.refresh()
+            guard let self, self.viewIfLoaded?.window?.isVisible == true else { return }
+            self.refresh()
         }
         RunLoop.main.add(timer!, forMode: .common)
     }
@@ -321,24 +323,69 @@ final class PanelViewController: NSViewController {
         rebuild()
     }
 
-    /// 采集并显示 CPU / 内存 / 温度（面板可见时才采样，避免无谓开销）
+    /// 采集并显示系统状态（仅在面板可见时采样，关闭后立刻停止）
     func refreshSystemLine() {
         guard viewIfLoaded?.window?.isVisible == true else { return }
         bctl_sysmon_init()
         var info = bctl_sysinfo()
         bctl_sysmon_sample(&info)
-        var parts: [String] = []
+
+        var lines: [String] = []
+        var row1: [String] = []
         if info.cpu_percent >= 0 {
-            parts.append(String(format: "%@ %.0f%%", L(BCTL_T_SYS_CPU.rawValue), info.cpu_percent))
+            row1.append(String(format: "%@ %.0f%%", L(BCTL_T_SYS_CPU.rawValue), info.cpu_percent))
+        }
+        if info.gpu_percent >= 0 {
+            row1.append(String(format: "%@ %.0f%%", L(BCTL_T_SYS_GPU.rawValue), info.gpu_percent))
         }
         if info.mem_percent >= 0 {
-            parts.append(String(format: "%@ %.0f%%", L(BCTL_T_SYS_MEM.rawValue), info.mem_percent))
+            row1.append(String(format: "%@ %.0f%%", L(BCTL_T_SYS_MEM.rawValue), info.mem_percent))
         }
+        if !row1.isEmpty { lines.append(row1.joined(separator: "   ")) }
+
+        var row2: [String] = []
         if info.temp_available && info.cpu_temp > 0 {
-            parts.append(String(format: "%@ %.0f°C", L(BCTL_T_SYS_TEMP.rawValue), info.cpu_temp))
+            row2.append(String(format: "%@ %.0f°C", L(BCTL_T_SYS_TEMP.rawValue), info.cpu_temp))
         }
-        parts.append(String(format: "%@ %.2f", L(BCTL_T_SYS_LOAD.rawValue), info.load1))
-        sysLabel.stringValue = parts.joined(separator: "   ")
+        if info.has_battery && info.battery_percent >= 0 {
+            var b = String(format: "%@ %.0f%%", L(BCTL_T_SYS_BATTERY.rawValue), info.battery_percent)
+            if info.battery_charging { b += " " + L(BCTL_T_SYS_CHARGING.rawValue) }
+            else if info.battery_on_ac { b += " " + L(BCTL_T_SYS_ON_AC.rawValue) }
+            row2.append(b)
+        }
+        if info.disk_percent >= 0 {
+            row2.append(String(format: "%@ %.0f%%", L(BCTL_T_SYS_DISK.rawValue), info.disk_percent))
+        }
+        if !row2.isEmpty { lines.append(row2.joined(separator: "   ")) }
+
+        var row3: [String] = []
+        if info.net_available && info.net_rx_bps >= 0 {
+            row3.append(String(format: "↓%@ ↑%@",
+                               Self.rateText(info.net_rx_bps), Self.rateText(info.net_tx_bps)))
+        }
+        row3.append(String(format: "%@ %.2f", L(BCTL_T_SYS_LOAD.rawValue), info.load1))
+        if info.uptime_seconds > 0 {
+            row3.append(String(format: "%@ %@", L(BCTL_T_SYS_UPTIME.rawValue),
+                               Self.uptimeText(info.uptime_seconds)))
+        }
+        lines.append(row3.joined(separator: "   "))
+
+        sysLabel.stringValue = lines.joined(separator: "\n")
+    }
+
+    private static func rateText(_ bps: Double) -> String {
+        if bps < 0 { return "-" }
+        if bps < 1024 { return String(format: "%.0fB/s", bps) }
+        if bps < 1048576 { return String(format: "%.0fKB/s", bps / 1024) }
+        return String(format: "%.1fMB/s", bps / 1048576)
+    }
+
+    private static func uptimeText(_ sec: Double) -> String {
+        let s = Int(sec)
+        let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
+        if d > 0 { return "\(d)d \(h)h" }
+        if h > 0 { return "\(h)h \(m)m" }
+        return "\(m)m"
     }
 
     func startSystemSampling() {
@@ -373,7 +420,7 @@ final class PanelViewController: NSViewController {
             let row = DisplayRow(display: buf[i])
             row.translatesAutoresizingMaskIntoConstraints = false
             stack.addArrangedSubview(row)            // 先入层级，再建跨视图约束
-            row.heightAnchor.constraint(equalToConstant: 46).isActive = true
+            row.heightAnchor.constraint(equalToConstant: 50).isActive = true
             row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
             rows.append(row)
         }
@@ -388,9 +435,9 @@ final class PanelViewController: NSViewController {
         autoCheck.state = Prefs.autoBlankBuiltin ? .on : .off
 
         // 面板高度随屏数变化
-        let height = CGFloat(210 + n * 56)
-        view.setFrameSize(NSSize(width: 320, height: height))
-        preferredContentSize = NSSize(width: 320, height: height)
+        let height = CGFloat(268 + n * 58)
+        view.setFrameSize(NSSize(width: 340, height: height))
+        preferredContentSize = NSSize(width: 340, height: height)
     }
 
     private func refresh() {
@@ -485,7 +532,7 @@ private func brightctlDisplayChanged(_ display: CGDirectDisplayID,
 
 // MARK: - 菜单栏
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private let panel = PanelViewController()
@@ -521,6 +568,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover = NSPopover()
         popover.contentViewController = panel
         popover.behavior = .transient
+        popover.delegate = self
         popover.animates = true
 
         CGDisplayRegisterReconfigurationCallback(
@@ -677,14 +725,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func handleDisplaysChanged() { scheduleTopologyCheck() }
 
+    /// 所有关闭路径（点外部、Esc、performClose）都会到这里，统一停掉采样
+    func popoverDidClose(_ notification: Notification) {
+        panel.stopSystemSampling()
+    }
+
+    /// 打开时才启动采样，保证后台零轮询
+    func popoverWillShow(_ notification: Notification) {
+        panel.startSystemSampling()
+    }
+
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
-            popover.performClose(nil)
-            panel.stopSystemSampling()
+            popover.performClose(nil)      // 关闭事件由 popoverDidClose 统一收尾
         } else {
             panel.reload()
-            panel.startSystemSampling()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }

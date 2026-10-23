@@ -218,11 +218,16 @@ display id=0x1 (内建)  brightness=56.0%  channel=DisplayServices
 ```text
 $ brightctl2 sys
 系统状态
-  CPU     46.6%   (11/11)
-  内存    80.9%   (14913/18432 MB)
-  温度    57.8°C   (GPU 50.0°C)
-  负载    8.86  7.48  6.54
-  进程    758
+  CPU     36.4%   (11/11)
+  GPU     80.0%
+  内存    77.4%   (14275/18432 MB)
+  温度    57.1°C   (GPU 50.0°C)
+  磁盘    93.0%   (428/460 GB)
+  电池    80.0%   外接电源
+  网络 ↓4.4 KB/s  ↑6.7 KB/s
+  负载    4.87  5.56  5.92
+  已运行  6d 3h
+  进程    784
 ```
 
 数据全部来自系统公开接口，**不需要 root，也不需要额外依赖**：
@@ -233,9 +238,23 @@ $ brightctl2 sys
 | 内存 | `host_statistics64(HOST_VM_INFO64)`，口径为 app + wired + compressed |
 | CPU/GPU 温度 | `IOHIDEventSystemClient` 枚举 `PMU tdie*` / `PMU tdev*` 传感器 |
 | 负载 | `sysctl vm.loadavg` |
+| GPU 占用 | `IOAccelerator` 的 `PerformanceStatistics` |
+| 磁盘 | `statfs` 读数据卷 |
+| 电池 | IOKit `AppleSmartBattery` |
+| 网络速率 | `getifaddrs` 累计字节求差 |
+| 开机时长 | `sysctl kern.boottime` |
 | 进程数 | `sysctl kern.proc.all` |
 
 温度取自 Apple Silicon 的 PMU 传感器。若机型不提供这些传感器，该行会显示「不可用」而不是给出假数据。
+
+### 资源占用
+
+监控**只在面板打开时运行**，关掉面板立刻停止采样，后台不轮询：
+
+- 采样本身约 0.1 ms；面板每 2 秒刷新一次，折算约 0.005% CPU
+- 温度/GPU 每 4 秒、电池每 8 秒、磁盘每 10 秒才读一次，用缓存填充
+- 实测后台空闲 15 秒，进程 CPU 时间只增加 0.01 秒
+- 不使用 `ioreg -l`（那要 0.5 秒），全部走定向 IOKit 查询
 
 ## 验收
 

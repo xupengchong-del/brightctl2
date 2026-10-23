@@ -214,11 +214,16 @@ Exit codes: `0` success, `1` runtime failure (cannot read/write/find the display
 ```text
 $ brightctl2 sys
 System
-  CPU     46.6%   (11/11)
-  Memory  80.9%   (14913/18432 MB)
-  Temp    57.8°C   (GPU 50.0°C)
-  Load   8.86  7.48  6.54
-  Procs  758
+  CPU     36.4%   (11/11)
+  GPU     80.0%
+  Memory  77.4%   (14275/18432 MB)
+  Temp    57.1°C   (GPU 50.0°C)
+  Disk    93.0%   (428/460 GB)
+  Battery  80.0%   on AC
+  Net    ↓4.4 KB/s  ↑6.7 KB/s
+  Load   4.87  5.56  5.92
+  Uptime 6d 3h
+  Procs  784
 ```
 
 Everything comes from public system interfaces — **no root, no extra dependencies**:
@@ -229,10 +234,25 @@ Everything comes from public system interfaces — **no root, no extra dependenc
 | Memory | `host_statistics64(HOST_VM_INFO64)`: app + wired + compressed |
 | CPU/GPU temperature | `IOHIDEventSystemClient`, reading `PMU tdie*` / `PMU tdev*` sensors |
 | Load | `sysctl vm.loadavg` |
+| GPU usage | `PerformanceStatistics` on `IOAccelerator` |
+| Disk | `statfs` on the data volume |
+| Battery | IOKit `AppleSmartBattery` |
+| Network rate | `getifaddrs` byte counters, delta |
+| Uptime | `sysctl kern.boottime` |
 | Process count | `sysctl kern.proc.all` |
 
 Temperature comes from Apple Silicon PMU sensors. On machines without them the row shows
 "unavailable" rather than inventing a number.
+
+### Resource usage
+
+Sampling runs **only while the panel is open**; closing it stops everything, nothing polls in the
+background:
+
+- One sample costs about 0.1 ms; refreshing every 2 s is roughly 0.005% CPU
+- Temperature/GPU refresh every 4 s, battery every 8 s, disk every 10 s, served from cache
+- Measured: 15 s idle in the background added 0.01 s of process CPU time
+- No `ioreg -l` (that takes 0.5 s); everything uses targeted IOKit queries
 
 ## Tests
 
