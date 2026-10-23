@@ -13,6 +13,7 @@
 #include <CoreGraphics/CoreGraphics.h>
 
 #include "brightctl_core.h"
+#include "brightctl_sysmon.h"
 
 static bctl_display g_list[BCTL_MAX_DISPLAYS];
 static int g_n;
@@ -57,6 +58,42 @@ static void cmd_list(void) {
     }
 }
 
+static void cmd_sys(void) {
+    bctl_sysmon_init();
+    bctl_sysinfo a, b;
+    /* 两次采样之间留出间隔，CPU 占用率才有意义 */
+    bctl_sysmon_sample(&a);
+    usleep(400000);
+    bctl_sysmon_sample(&b);
+
+    printf("%s\n", bctl_t(BCTL_T_SYS_TITLE));
+
+    if (b.cpu_percent >= 0)
+        printf("  %-6s %5.1f%%   (%d/%d)\n", bctl_t(BCTL_T_SYS_CPU), b.cpu_percent,
+               b.core_count, b.cpu_count);
+    else
+        printf("  %-6s %s\n", bctl_t(BCTL_T_SYS_CPU), bctl_t(BCTL_T_SYS_UNAVAILABLE));
+
+    if (b.mem_percent >= 0)
+        printf("  %-6s %5.1f%%   (%.0f/%.0f MB)\n", bctl_t(BCTL_T_SYS_MEM), b.mem_percent,
+               b.mem_used_mb, b.mem_total_mb);
+    else
+        printf("  %-6s %s\n", bctl_t(BCTL_T_SYS_MEM), bctl_t(BCTL_T_SYS_UNAVAILABLE));
+
+    if (b.temp_available)
+        printf("  %-6s %5.1f°C   (GPU %.1f°C)\n",
+               bctl_t(BCTL_T_SYS_TEMP), b.cpu_temp, b.gpu_temp);
+    else
+        printf("  %-6s %s\n", bctl_t(BCTL_T_SYS_TEMP), bctl_t(BCTL_T_SYS_UNAVAILABLE));
+
+    if (b.load1 >= 0)
+        printf("  %-6s %.2f  %.2f  %.2f\n", bctl_t(BCTL_T_SYS_LOAD),
+               b.load1, b.load5, b.load15);
+
+    if (b.process_count > 0)
+        printf("  %-6s %d\n", bctl_t(BCTL_T_SYS_PROC), b.process_count);
+}
+
 int main(int argc, char **argv) {
     /* 先剥离 --lang，保证之后所有文案都按目标语言输出 */
     const char *lang = NULL;
@@ -83,6 +120,9 @@ int main(int argc, char **argv) {
         printf("%s", bctl_t(BCTL_T_USAGE));
         return 0;
     }
+
+    /* sys 不依赖显示器，先于 load() 处理，避免没有可用屏幕时被拦下 */
+    if (base < argc && !strcmp(argv[base], "sys")) { cmd_sys(); return 0; }
 
     if (base + 1 < argc && !strcmp(argv[base], "blank") && !strcmp(argv[base + 1], "off")) {
         bctl_init();

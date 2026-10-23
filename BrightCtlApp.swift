@@ -179,6 +179,8 @@ final class PanelViewController: NSViewController {
     private let hintLabel = NSTextField(labelWithString: "")
     private let stack = NSStackView()
     private let quit = NSButton(title: "", target: nil, action: nil)
+    private let sysLabel = NSTextField(labelWithString: "")
+    private var sysTimer: Timer?
 
     /// 切换语言后刷新所有静态文案
     private func applyTexts() {
@@ -188,6 +190,7 @@ final class PanelViewController: NSViewController {
         loginCheck.title = L(BCTL_T_CHECK_LOGIN.rawValue)
         autoCheck.title = L(BCTL_T_CHECK_AUTO.rawValue)
         quit.title = L(BCTL_T_QUIT.rawValue)
+        refreshSystemLine()
 
         langPopup.removeAllItems()
         langPopup.addItem(withTitle: L(BCTL_T_LANG_AUTO.rawValue))
@@ -228,6 +231,11 @@ final class PanelViewController: NSViewController {
         hintLabel.font = .systemFont(ofSize: 10)
         hintLabel.textColor = .tertiaryLabelColor
 
+        sysLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        sysLabel.textColor = .secondaryLabelColor
+        sysLabel.maximumNumberOfLines = 2
+        sysLabel.lineBreakMode = .byWordWrapping
+
         langPopup.target = self
         langPopup.action = #selector(languageChanged(_:))
         langPopup.font = .systemFont(ofSize: 11)
@@ -258,6 +266,7 @@ final class PanelViewController: NSViewController {
         v.addSubview(loginCheck)
         v.addSubview(autoCheck)
         v.addSubview(langPopup)
+        v.addSubview(sysLabel)
         v.addSubview(quit)
 
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -266,6 +275,7 @@ final class PanelViewController: NSViewController {
         loginCheck.translatesAutoresizingMaskIntoConstraints = false
         autoCheck.translatesAutoresizingMaskIntoConstraints = false
         langPopup.translatesAutoresizingMaskIntoConstraints = false
+        sysLabel.translatesAutoresizingMaskIntoConstraints = false
         quit.translatesAutoresizingMaskIntoConstraints = false
 
         NSLayoutConstraint.activate([
@@ -279,7 +289,11 @@ final class PanelViewController: NSViewController {
             hintLabel.topAnchor.constraint(equalTo: stack.bottomAnchor, constant: 8),
             hintLabel.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 16),
 
-            blankCheck.topAnchor.constraint(equalTo: hintLabel.bottomAnchor, constant: 8),
+            sysLabel.topAnchor.constraint(equalTo: hintLabel.bottomAnchor, constant: 6),
+            sysLabel.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 16),
+            sysLabel.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -16),
+
+            blankCheck.topAnchor.constraint(equalTo: sysLabel.bottomAnchor, constant: 8),
             blankCheck.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 14),
 
             autoCheck.topAnchor.constraint(equalTo: blankCheck.bottomAnchor, constant: 4),
@@ -305,6 +319,41 @@ final class PanelViewController: NSViewController {
 
     func reload() {
         rebuild()
+    }
+
+    /// 采集并显示 CPU / 内存 / 温度（面板可见时才采样，避免无谓开销）
+    func refreshSystemLine() {
+        guard viewIfLoaded?.window?.isVisible == true else { return }
+        bctl_sysmon_init()
+        var info = bctl_sysinfo()
+        bctl_sysmon_sample(&info)
+        var parts: [String] = []
+        if info.cpu_percent >= 0 {
+            parts.append(String(format: "%@ %.0f%%", L(BCTL_T_SYS_CPU.rawValue), info.cpu_percent))
+        }
+        if info.mem_percent >= 0 {
+            parts.append(String(format: "%@ %.0f%%", L(BCTL_T_SYS_MEM.rawValue), info.mem_percent))
+        }
+        if info.temp_available && info.cpu_temp > 0 {
+            parts.append(String(format: "%@ %.0f°C", L(BCTL_T_SYS_TEMP.rawValue), info.cpu_temp))
+        }
+        parts.append(String(format: "%@ %.2f", L(BCTL_T_SYS_LOAD.rawValue), info.load1))
+        sysLabel.stringValue = parts.joined(separator: "   ")
+    }
+
+    func startSystemSampling() {
+        sysTimer?.invalidate()
+        // 先采一次建立 CPU 基线，再按 2 秒刷新
+        _ = bctl_sysmon_cpu_percent()
+        sysTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.refreshSystemLine()
+        }
+        if let t = sysTimer { RunLoop.main.add(t, forMode: .common) }
+    }
+
+    func stopSystemSampling() {
+        sysTimer?.invalidate()
+        sysTimer = nil
     }
 
     var rowCount: Int { rows.count }
@@ -339,7 +388,7 @@ final class PanelViewController: NSViewController {
         autoCheck.state = Prefs.autoBlankBuiltin ? .on : .off
 
         // 面板高度随屏数变化
-        let height = CGFloat(182 + n * 56)
+        let height = CGFloat(210 + n * 56)
         view.setFrameSize(NSSize(width: 320, height: height))
         preferredContentSize = NSSize(width: 320, height: height)
     }
@@ -632,8 +681,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(nil)
+            panel.stopSystemSampling()
         } else {
             panel.reload()
+            panel.startSystemSampling()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }

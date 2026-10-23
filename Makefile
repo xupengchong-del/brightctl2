@@ -2,6 +2,7 @@ CC      ?= clang
 SWIFTC  ?= swiftc
 CFLAGS  ?= -O2 -Wall -Wextra
 LDFLAGS  = -ldl -framework CoreGraphics -framework IOKit -framework CoreFoundation
+CORE     = brightctl_core.c brightctl_sysmon.c
 
 BIN     = brightctl2
 APP     = BrightCtl.app
@@ -10,18 +11,19 @@ APP     = BrightCtl.app
 
 all: $(BIN)
 
-$(BIN): brightctl2.c brightctl_core.c brightctl_core.h
-	$(CC) $(CFLAGS) -o $@ brightctl2.c brightctl_core.c $(LDFLAGS)
+$(BIN): brightctl2.c $(CORE) brightctl_core.h brightctl_sysmon.h
+	$(CC) $(CFLAGS) -o $@ brightctl2.c $(CORE) $(LDFLAGS)
 
 # 菜单栏应用：Swift 壳 + C 核心
 app: $(APP)
 
-$(APP): BrightCtlApp.swift brightctl_core.c brightctl_core.h BrightCtl-Info.plist BrightCtl-Bridging-Header.h
+$(APP): BrightCtlApp.swift $(CORE) brightctl_core.h brightctl_sysmon.h BrightCtl-Info.plist BrightCtl-Bridging-Header.h
 	rm -rf $(APP)
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
-	$(CC) $(CFLAGS) -c brightctl_core.c -o /tmp/brightctl_core.o -I.
+	$(CC) $(CFLAGS) -c $(CORE) -I.
+	mv brightctl_core.o brightctl_sysmon.o /tmp/ 2>/dev/null || true
 	$(SWIFTC) -O -parse-as-library -swift-version 5 -o $(APP)/Contents/MacOS/BrightCtl \
-	  BrightCtlApp.swift /tmp/brightctl_core.o \
+	  BrightCtlApp.swift /tmp/brightctl_core.o /tmp/brightctl_sysmon.o \
 	  -import-objc-header BrightCtl-Bridging-Header.h \
 	  -framework Cocoa -framework CoreGraphics -framework IOKit -framework CoreFoundation -ldl
 	cp BrightCtl-Info.plist $(APP)/Contents/Info.plist

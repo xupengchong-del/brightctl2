@@ -181,6 +181,7 @@ brightctl2 down [step]    brightness of the primary target display -step (defaul
 brightctl2 sync           align other controllable displays to the primary target
 brightctl2 all <v>        set every controllable display to v
 brightctl2 blank [on|off] mirror and darken/restore built-in (restores on exit)
+brightctl2 sys            show CPU / memory / temperature / load / processes
 brightctl2 --lang zh|en   force the output language (default: follow the system)
 brightctl2 --help         usage
 ```
@@ -206,13 +207,40 @@ Exit codes: `0` success, `1` runtime failure (cannot read/write/find the display
 
 ---
 
+## System status
+
+`brightctl2 sys` and the menu bar panel both show live system stats:
+
+```text
+$ brightctl2 sys
+System
+  CPU     46.6%   (11/11)
+  Memory  80.9%   (14913/18432 MB)
+  Temp    57.8°C   (GPU 50.0°C)
+  Load   8.86  7.48  6.54
+  Procs  758
+```
+
+Everything comes from public system interfaces — **no root, no extra dependencies**:
+
+| Metric | Source |
+|---|---|
+| CPU usage | `host_processor_info(PROCESSOR_CPU_LOAD_INFO)`, delta between two samples |
+| Memory | `host_statistics64(HOST_VM_INFO64)`: app + wired + compressed |
+| CPU/GPU temperature | `IOHIDEventSystemClient`, reading `PMU tdie*` / `PMU tdev*` sensors |
+| Load | `sysctl vm.loadavg` |
+| Process count | `sysctl kern.proc.all` |
+
+Temperature comes from Apple Silicon PMU sensors. On machines without them the row shows
+"unavailable" rather than inventing a number.
+
 ## Tests
 
 ```bash
 make test
 ```
 
-`test.sh` really changes brightness and covers 27 CLI assertions, restoring every display to its
+`test.sh` really changes brightness and covers 32 CLI assertions, restoring every display to its
 starting value when it exits. A separate hardware-free suite covers 18 blank/restore failure scenarios:
 
 1. enumeration (display count, controllable count)

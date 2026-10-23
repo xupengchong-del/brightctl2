@@ -187,6 +187,7 @@ brightctl2 down [step]    主目标屏亮度 -step（默认 5）
 brightctl2 sync           其余可调屏亮度对齐主目标屏
 brightctl2 all <v>        所有可调屏亮度设为 v
 brightctl2 blank [on|off] 镜像内屏并关闭背光/恢复（退出时自动恢复）
+brightctl2 sys            显示 CPU/内存/温度/负载/进程数
 brightctl2 --lang zh|en   手动指定输出语言（默认跟随系统）
 brightctl2 --help         用法
 ```
@@ -210,13 +211,39 @@ display id=0x1 (内建)  brightness=56.0%  channel=DisplayServices
 
 ---
 
+## 系统状态
+
+`brightctl2 sys` 与菜单栏面板都会显示实时系统状态：
+
+```text
+$ brightctl2 sys
+系统状态
+  CPU     46.6%   (11/11)
+  内存    80.9%   (14913/18432 MB)
+  温度    57.8°C   (GPU 50.0°C)
+  负载    8.86  7.48  6.54
+  进程    758
+```
+
+数据全部来自系统公开接口，**不需要 root，也不需要额外依赖**：
+
+| 指标 | 数据源 |
+|---|---|
+| CPU 占用 | `host_processor_info(PROCESSOR_CPU_LOAD_INFO)`，两次采样求差 |
+| 内存 | `host_statistics64(HOST_VM_INFO64)`，口径为 app + wired + compressed |
+| CPU/GPU 温度 | `IOHIDEventSystemClient` 枚举 `PMU tdie*` / `PMU tdev*` 传感器 |
+| 负载 | `sysctl vm.loadavg` |
+| 进程数 | `sysctl kern.proc.all` |
+
+温度取自 Apple Silicon 的 PMU 传感器。若机型不提供这些传感器，该行会显示「不可用」而不是给出假数据。
+
 ## 验收
 
 ```bash
 make test
 ```
 
-`test.sh` 会真实读写亮度，覆盖 27 项 CLI 断言，结束前把每台屏还原到起始值。另有 18 项不接触硬件的关闭/恢复故障测试：
+`test.sh` 会真实读写亮度，覆盖 32 项 CLI 断言，结束前把每台屏还原到起始值。另有 18 项不接触硬件的关闭/恢复故障测试：
 
 1. 枚举（屏数、可控屏数）
 2. `get` 返回值落在 0–100

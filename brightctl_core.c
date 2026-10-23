@@ -651,7 +651,8 @@ static const bctl_msg g_msgs[BCTL_T_COUNT] = {
         "  brightctl2 down [step]    主目标屏 -step (默认 5)\n"
         "  brightctl2 sync           其余可调屏对齐主目标屏\n"
         "  brightctl2 all <v>        所有可调屏设为 v\n"
-        "  brightctl2 blank [on|off] 内建屏黑屏/恢复（进程需存活）\n"
+        "  brightctl2 blank [on|off] 内建屏黑屏/恢复（退出时自动恢复）\n"
+        "  brightctl2 sys            显示 CPU/内存/温度/负载\n"
         "  brightctl2 --lang zh|en   手动指定输出语言\n",
         "Usage:\n"
         "  brightctl2                list displays and current brightness\n"
@@ -661,7 +662,8 @@ static const bctl_msg g_msgs[BCTL_T_COUNT] = {
         "  brightctl2 down [step]    primary target -step (default 5)\n"
         "  brightctl2 sync           align other controllable displays to primary\n"
         "  brightctl2 all <v>        set every controllable display to v\n"
-        "  brightctl2 blank [on|off] blank/restore built-in display (process must live)\n"
+        "  brightctl2 blank [on|off] blank/restore built-in display (restores on exit)\n"
+        "  brightctl2 sys            show CPU/memory/temperature/load\n"
         "  brightctl2 --lang zh|en   force the output language\n"
     },
     [BCTL_T_NEED_ID]          = {"需要显示器 id", "display id required"},
@@ -703,8 +705,18 @@ static const bctl_msg g_msgs[BCTL_T_COUNT] = {
     [BCTL_T_ALERT_BLANK_ON_MSG]   = {"未检测到外接显示器。为免失去所有画面，已拒绝关闭内屏。",
                                      "No external display detected. Refusing to blank the built-in display so you do not lose all video output."},
     [BCTL_T_ALERT_BLANK_OFF_TITLE] = {"无法恢复内建屏", "Cannot restore the built-in display"},
-    [BCTL_T_ALERT_BLANK_OFF_MSG]   = {"释放捕获失败，请重新打开面板重试。",
-                                      "Failed to release the capture. Reopen the panel and try again."},
+    [BCTL_T_ALERT_BLANK_OFF_MSG]   = {"恢复内建屏失败，请重试。",
+                                      "Failed to restore the built-in display. Please try again."},
+
+    [BCTL_T_SYS_TITLE]       = {"系统状态", "System"},
+    [BCTL_T_SYS_CPU]         = {"CPU", "CPU"},
+    [BCTL_T_SYS_MEM]         = {"内存", "Memory"},
+    [BCTL_T_SYS_TEMP]        = {"温度", "Temp"},
+    [BCTL_T_SYS_LOAD]        = {"负载", "Load"},
+    [BCTL_T_SYS_PROC]        = {"进程", "Procs"},
+    [BCTL_T_SYS_UNAVAILABLE] = {"不可用", "unavailable"},
+    [BCTL_T_USAGE_SYS]       = {"  brightctl2 sys            显示 CPU/内存/温度/负载\n",
+                                "  brightctl2 sys            show CPU/memory/temperature/load\n"},
 };
 
 static char g_lang_setting[8] = "auto";

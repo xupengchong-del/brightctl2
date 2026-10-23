@@ -93,7 +93,16 @@ echo "== 8. 参数与错误处理 =="
 "$BIN" bogus >/dev/null 2>&1; check_eq "$?" 2 "未知命令退出码"
 "$BIN" --help >/dev/null 2>&1; check_eq "$?" 0 "--help 退出码"
 
-echo "== 9. 英文输出冒烟 =="
+echo "== 9. sys 系统状态 =="
+SYS_ZH="$($BIN --lang zh sys 2>&1)"
+printf '%s\n' "$SYS_ZH" | grep -q '系统状态' && ok "sys 标题" || bad "sys 标题异常: $SYS_ZH"
+printf '%s\n' "$SYS_ZH" | grep -Eq 'CPU +[0-9]+\.[0-9]%' && ok "sys CPU 数值" || bad "sys CPU 异常"
+printf '%s\n' "$SYS_ZH" | grep -Eq '内存 +[0-9]+\.[0-9]%' && ok "sys 内存数值" || bad "sys 内存异常"
+printf '%s\n' "$SYS_ZH" | grep -Eq '负载 [0-9]' && ok "sys 负载数值" || bad "sys 负载异常"
+SYS_EN="$($BIN --lang en sys 2>&1)"
+printf '%s\n' "$SYS_EN" | grep -q 'System' && ok "sys 英文标题" || bad "sys 英文标题异常: $SYS_EN"
+
+echo "== 10. 英文输出冒烟 =="
 EN_OUT="$(BRIGHTCTL_LANG=en $BIN --lang en 2>&1)"
 printf '%s
 ' "$EN_OUT" | grep -q 'channel=DDC\|channel=DisplayServices' && ok "英文列屏可用" || bad "英文列屏异常: $EN_OUT"
